@@ -86,7 +86,7 @@ def fetch_page_content(title, visited):
     params = {
         "action": "query",
         "titles": title,
-        "prop": "revisions|categories",  # Fetch content and categories
+        "prop": "revisions|links|categories",  # Fetch content, links (to detect redirect), and categories
         "rvprop": "content",
         "format": "json",
     }
@@ -99,23 +99,40 @@ def fetch_page_content(title, visited):
     categories = []  # List to store categories
 
     for page_id, page_info in pages.items():
-        if "redirects" in page_info:  # Check if it's a redirect
-            redirect_title = page_info["redirects"][0]["title"]
-            print(f"Redirected from {title} to {redirect_title}")
-            if redirect_title not in visited:  # Only follow the redirect if it hasn't been visited yet
-                visited.add(redirect_title)  # Mark the redirected page as visited
-                return fetch_page_content(redirect_title, visited)  # Recursively fetch the target page
-            else:
-                return None  # If we've already visited the redirected page, skip it
-
         if "revisions" in page_info:
-            # Collect categories
+            content = page_info["revisions"][0]["*"]  # Page content (wikitext)
+
+            # Check for redirect (i.e., #REDIRECT at the start of the page)
+            if content.startswith("#REDIRECT"):
+                # Extract the redirect target from the content
+                redirect_target = content.split("\n")[0].replace("#REDIRECT", "").strip()
+                if redirect_target[0] == ":":
+                    redirect_target = redirect_target[1:]
+                if redirect_target[0:2] == "[[":
+                    redirect_target = redirect_target.strip("[[")
+                if redirect_target[-2:] =="]]":
+                    redirect_target = redirect_target.strip("]]")
+                if redirect_target[0] == ":":
+                    redirect_target = redirect_target[1:]
+
+                redirect_target = redirect_target.split("#")[0]
+
+                # Check if the target is a valid page title and it's not visited
+                if redirect_target not in visited:
+                    visited.add(redirect_target)  # Mark the redirected page as visited
+                    print(f"Redirected from {title} to {redirect_target}")
+                    return fetch_page_content(redirect_target, visited)  # Recursively fetch the target page
+                else:
+                    print(f"Skipping already visited redirect: {redirect_target}")
+                    return None, categories  # If redirected page is already visited, skip it
+
+            # Collect categories if they exist
             if "categories" in page_info:
                 categories = [category["title"] for category in page_info["categories"]]
 
-            return page_info["revisions"][0]["*"], categories  # Return both content and categories
+            return content, categories  # Return both content and categories
 
-    return None, categories
+    return None, categories  # Return None if page has no content
 
 
 def get_content_hash(content):
