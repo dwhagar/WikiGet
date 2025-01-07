@@ -3,9 +3,10 @@ import json
 import time
 import argparse
 import pypandoc
+import hashlib
 
 # Global Variables
-WIKI_URL = "https://wiki.moltenaether.com/db/api.php"
+WIKI_URL = "https://wiki.moltenaether.com/w/api.php"
 API_KEY = None  # Optional: Provide an API key here if required (e.g., "your_api_key")
 
 
@@ -37,9 +38,9 @@ def fetch_category_pages(category):
     return pages
 
 
-def fetch_page_links(title):
+def fetch_page_links(title, visited):
     """
-    Fetch all linked pages on a given page.
+    Fetch all linked pages on a given page, following redirects if necessary.
     """
     links = []
     plcontinue = None
@@ -57,7 +58,17 @@ def fetch_page_links(title):
 
         response = requests.get(WIKI_URL, params=params).json()
         pages = response["query"]["pages"]
+
         for page_id, page_info in pages.items():
+            if "redirects" in page_info:  # Check if it's a redirect
+                redirect_title = page_info["redirects"][0]["title"]
+                print(f"Redirected from {title} to {redirect_title}")
+                if redirect_title not in visited:  # Only follow the redirect if it hasn't been visited yet
+                    visited.add(redirect_title)  # Mark the redirected page as visited
+                    return fetch_page_links(redirect_title, visited)  # Recursively fetch the target page
+                else:
+                    return []  # If we've already visited the redirected page, return empty links
+
             if "links" in page_info:
                 links.extend(link["title"] for link in page_info["links"])
 
@@ -68,14 +79,14 @@ def fetch_page_links(title):
     return links
 
 
-def fetch_page_content(title):
+def fetch_page_content(title, visited):
     """
-    Fetch the wikitext content of a given page.
+    Fetch the wikitext content and categories of a given page, following redirects if necessary.
     """
     params = {
         "action": "query",
         "titles": title,
-        "prop": "revisions",
+        "prop": "revisions|categories",  # Fetch content and categories
         "rvprop": "content",
         "format": "json",
     }
@@ -84,20 +95,35 @@ def fetch_page_content(title):
 
     response = requests.get(WIKI_URL, params=params).json()
     pages = response["query"]["pages"]
+
+    categories = []  # List to store categories
+
     for page_id, page_info in pages.items():
+        if "redirects" in page_info:  # Check if it's a redirect
+            redirect_title = page_info["redirects"][0]["title"]
+            print(f"Redirected from {title} to {redirect_title}")
+            if redirect_title not in visited:  # Only follow the redirect if it hasn't been visited yet
+                visited.add(redirect_title)  # Mark the redirected page as visited
+                return fetch_page_content(redirect_title, visited)  # Recursively fetch the target page
+            else:
+                return None  # If we've already visited the redirected page, skip it
+
         if "revisions" in page_info:
-            return page_info["revisions"][0]["*"]
+            # Collect categories
+            if "categories" in page_info:
+                categories = [category["title"] for category in page_info["categories"]]
 
-    return None
+            return page_info["revisions"][0]["*"], categories  # Return both content and categories
+
+    return None, categories
 
 
-def crawl_wiki(start_category):
-    """
-    Crawl the wiki starting from a given category.
-    """
-    visited = set()
-    queue = fetch_category_pages(start_category)
-    result = []
+def get_content_hash(content):
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+
+def crawl_wiki(queue, visited, visited_content, result):
+    base_url = "https://wiki.moltenaether.com/db/"
 
     while queue:
         title = queue.pop(0)
@@ -105,13 +131,40 @@ def crawl_wiki(start_category):
             continue
         visited.add(title)
 
+        # Follow links and get content, handling redirects if necessary
+        links = fetch_page_links(title, visited)
+
         print(f"Processing: {title}")
-        content = fetch_page_content(title)
-        if content:
-            result.append({"title": title, "content": content})
+        # Define a list of banned categories
+        banned_categories = ["Abandoned"]
+
+        # Fetch content and categories
+        content, categories = fetch_page_content(title, visited)
+
+        # Check if content exists and if any categories are banned
+        if content and not any(banned_category.lower()
+                               in category.lower() for category
+                               in categories for banned_category
+                               in banned_categories):
+            content_hash = get_content_hash(content)
+            if content_hash in visited_content:
+                continue  # Skip if content is already visited
+
+            visited_content.add(content_hash)
+
+            # Construct the URL for the article
+            article_url = base_url + title.replace(" ", "_")
+
+            # Add the URL and categories field to the result
+            result.append({
+                "title": title,
+                "content": content,
+                "links": links,
+                "url": article_url,
+                "categories": categories  # Add categories field
+            })
 
         # Get linked pages and add them to the queue
-        links = fetch_page_links(title)
         queue.extend(link for link in links if link not in visited)
 
         # Respect API limits
@@ -120,12 +173,19 @@ def crawl_wiki(start_category):
     return result
 
 
-def save_to_json(data, filename):
+import json
+
+
+def save_to_json(data, filename: str) -> None:
     """
-    Save data to a JSON file.
+    Save data to a JSON file by first converting to a string.
     """
-    with open(filename, "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=4)
+    # Convert the data to a JSON-formatted string
+    json_data = json.dumps(data, ensure_ascii=False, indent=4)
+
+    # Write the string to the file
+    with open(filename, "w", encoding="utf-8") as output_file:
+        output_file.write(json_data)
 
 
 def convert_to_markdown(data):
@@ -165,8 +225,16 @@ def main():
 
     args = parser.parse_args()
 
+    # Initialize variables
+    visited = set()
+    visited_content = set()
+    result = []
+
+    # Get list of pages in the category
+    queue = fetch_category_pages(args.category)
+
     # Crawl the wiki and save results
-    data = crawl_wiki(args.category)
+    data = crawl_wiki(queue, visited, visited_content, result)
     save_to_json(data, args.output)
 
     print(f"Data saved to {args.output}")
