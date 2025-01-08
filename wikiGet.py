@@ -96,7 +96,7 @@ def crawl_wiki(queue, visited, output_file):
         # If content exists, write it to the file
         if content:
             with open(output_file, "a", encoding="utf-8") as f:
-                f.write(f"\n=== {title} ===\n")
+                f.write(f"\n= {title} =\n")
                 f.write(content)
                 f.write("\n\n")
 
