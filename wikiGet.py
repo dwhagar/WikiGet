@@ -5,6 +5,18 @@ import argparse
 # Global Variables
 WIKI_URL = "https://wiki.moltenaether.com/w/api.php"
 API_KEY = None  # Optional: Provide an API key here if required (e.g., "your_api_key")
+CATEGORY_BLACKLIST = [
+    "Abandoned",
+    "OOC",
+    "Stubs",
+    "Disambiguation",
+    "Sources of Inspiration",
+    "Star Trek",
+    "Star Wars"
+    ]  # Add blacklist categories here
+PAGE_BLACKLIST = ["User:"]
+visited = set()
+queue = []
 
 def fetch_category_pages(category):
     """
@@ -33,14 +45,14 @@ def fetch_category_pages(category):
 
     return pages
 
-def fetch_page_content(title, visited):
+def fetch_page_content(title):
     """
     Fetch the wikitext content of a given page, following redirects if necessary.
     """
     params = {
         "action": "query",
         "titles": title,
-        "prop": "revisions",  # Fetch content only
+        "prop": "revisions|categories",  # Fetch content and categories
         "rvprop": "content",
         "format": "json",
     }
@@ -55,6 +67,8 @@ def fetch_page_content(title, visited):
         print(f"Ignoring file link {title}.")
         return None
 
+    print(f"Processing: {title}")
+
     for page_id, page_info in pages.items():
         if "revisions" in page_info:
             content = page_info["revisions"][0]["*"]  # Page content (wikitext)
@@ -63,51 +77,67 @@ def fetch_page_content(title, visited):
             if content.startswith("#REDIRECT"):
                 # Extract the redirect target from the content
                 redirect_target = content.split("\n")[0].replace("#REDIRECT", "").strip()
-                redirect_target = redirect_target.strip("[]: ").split("#")[0]
+                if redirect_target[:2] == "[[":
+                    redirect_target = redirect_target[2:]
+                elif redirect_target[:3] == ":[[":
+                    redirect_target = redirect_target[3:]
+                if redirect_target[0] == ":":
+                    redirect_target = redirect_target[1:]
+                if redirect_target[-2:] == "]]":
+                    redirect_target = redirect_target[:-2]
+                redirect_target = redirect_target.split('#')[0]
 
-                # Check if the target is a valid page title and it's not visited
-                if redirect_target not in visited:
-                    visited.add(redirect_target)  # Mark the redirected page as visited
-                    print(f"Redirected from {title} to {redirect_target}")
-                    return fetch_page_content(redirect_target, visited)  # Recursively fetch the target page
-                else:
-                    print(f"Skipping already visited redirect: {redirect_target}")
-                    return None  # If redirected page is already visited, skip it
+                print(f"Redirected from {title} to {redirect_target}")
+
+                # Add the redirect target to the queue if not already visited or in the queue
+                if redirect_target not in visited and redirect_target not in queue:
+                    queue.append(redirect_target)
+
+                return None  # Skip fetching the redirected content immediately
+
+            # Check categories for blacklist
+            if "categories" in page_info:
+                categories = [cat["title"] for cat in page_info["categories"]]
+                for blacklist in CATEGORY_BLACKLIST:
+                    if any(blacklist.lower() in category.lower() for category in categories):
+                        print(f"Skipping page {title} due to blacklisted category: '{blacklist}'")
+                        return None
 
             return content  # Return the page content
 
     return None  # Return None if page has no content
 
-def crawl_wiki(queue, visited, output_file):
+def crawl_wiki(output_file):
     """
-    Crawl the wiki starting from a queue of page titles and write content to a file.
+    Crawl the wiki starting from the global queue of page titles and write content to a file.
     """
     while queue:
         title = queue.pop(0)
         if title in visited:
+            print(f"Skipping already visited page: {title}")
             continue
         visited.add(title)
 
-        print(f"Processing: {title}")
-
         # Fetch content
-        content = fetch_page_content(title, visited)
+        content = fetch_page_content(title)
 
         # If content exists, write it to the file
         if content:
             with open(output_file, "a", encoding="utf-8") as f:
-                f.write(f"\n= {title} =\n")
+                f.write(f"= {title} =\n")
                 f.write(content)
-                f.write("\n\n")
+                f.write("\n* * *\n")
 
         # Fetch linked pages and add to queue
-        links = fetch_page_links(title, visited)
-        queue.extend(link for link in links if link not in visited)
+        links = fetch_page_links(title)
+        for link in links:
+            if link not in visited and link not in queue:
+                queue.append(link)
 
         # Respect API limits
         time.sleep(0.5)
 
-def fetch_page_links(title, visited):
+def fetch_page_links(title):
     """
     Fetch all linked pages on a given page, following redirects if necessary.
     """
@@ -130,7 +160,14 @@ def fetch_page_links(title, visited):
 
         for page_id, page_info in pages.items():
             if "links" in page_info:
-                links.extend(link["title"] for link in page_info["links"])
+                for link in page_info["links"]:
+                    for blacklist in PAGE_BLACKLIST:
+                        if blacklist.lower() in link['title'].lower():
+                            if not link['title'] in visited:
+                                print(f"Skipping page {link['title']} due to blacklisted page: '{blacklist}'")
+                                visited.add(link['title'])
+                        else:
+                            links.append(link["title"])
 
         plcontinue = response.get("continue", {}).get("plcontinue")
         if not plcontinue:
@@ -156,14 +193,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Initialize variables
-    visited = set()
-
-    # Get list of pages in the category
+    # Initialize global queue with starting category pages
+    global queue
     queue = fetch_category_pages(args.category)
 
     # Crawl the wiki and save results
-    crawl_wiki(queue, visited, args.output)
+    crawl_wiki(args.output)
 
     print(f"Data saved to {args.output}")
 
