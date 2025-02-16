@@ -1,6 +1,8 @@
+import os  # Import os for directory-related checks
 import requests
 import time
 import argparse
+import re  # Import re for sanitizing filenames
 
 # Global Variables
 WIKI_URL = "https://wiki.moltenaether.com/w/api.php"
@@ -13,10 +15,32 @@ CATEGORY_BLACKLIST = [
     "Sources of Inspiration",
     "Star Trek",
     "Star Wars"
-    ]  # Add blacklist categories here
+]  # Add blacklist categories here
 PAGE_BLACKLIST = ["User:"]
 visited = set()
 queue = []
+
+
+def sanitize_filename(title):
+    """
+    Sanitize a title to be file name compliant by removing or replacing invalid characters.
+    """
+    # Replace invalid filename characters with underscores and limit length (optional)
+    sanitized_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+    return sanitized_title[:255]  # Ensure filename doesn't exceed max length for most OSs
+
+
+def validate_output_folder(output_folder):
+    """
+    Validate that the specified output folder exists and is writable.
+    """
+    if not os.path.exists(output_folder):
+        print(f"The specified folder '{output_folder}' does not exist.")
+        exit(1)
+    if not os.access(output_folder, os.W_OK):
+        print(f"The specified folder '{output_folder}' is not writable.")
+        exit(1)
+
 
 def fetch_category_pages(category):
     """
@@ -44,6 +68,7 @@ def fetch_category_pages(category):
             break
 
     return pages
+
 
 def fetch_page_content(title):
     """
@@ -107,35 +132,6 @@ def fetch_page_content(title):
 
     return None  # Return None if page has no content
 
-def crawl_wiki(output_file):
-    """
-    Crawl the wiki starting from the global queue of page titles and write content to a file.
-    """
-    while queue:
-        title = queue.pop(0)
-        if title in visited:
-            print(f"Skipping already visited page: {title}")
-            continue
-        visited.add(title)
-
-        # Fetch content
-        content = fetch_page_content(title)
-
-        # If content exists, write it to the file
-        if content:
-            with open(output_file, "a", encoding="utf-8") as f:
-                f.write(f"= {title} =\n")
-                f.write(content)
-                f.write("\n* * *\n")
-
-        # Fetch linked pages and add to queue
-        links = fetch_page_links(title)
-        for link in links:
-            if link not in visited and link not in queue:
-                queue.append(link)
-
-        # Respect API limits
-        time.sleep(0.5)
 
 def fetch_page_links(title):
     """
@@ -175,6 +171,40 @@ def fetch_page_links(title):
 
     return links
 
+
+def crawl_wiki(output_folder):
+    """
+    Crawl the wiki starting from the global queue of page titles and save each as its own file.
+    """
+    while queue:
+        title = queue.pop(0)
+        if title in visited:
+            print(f"Skipping already visited page: {title}")
+            continue
+        visited.add(title)
+
+        # Fetch content
+        content = fetch_page_content(title)
+
+        # If content exists, write it to a unique file
+        if content:
+            sanitized_title = sanitize_filename(title)
+            file_name = os.path.join(output_folder, f"{sanitized_title}.txt")
+            with open(file_name, "w", encoding="utf-8") as f:
+                f.write(f"= {title} =\n")
+                f.write(content)
+            print(f"Saved: {file_name}")
+
+        # Fetch linked pages and add to queue
+        links = fetch_page_links(title)
+        for link in links:
+            if link not in visited and link not in queue:
+                queue.append(link)
+
+        # Respect API limits
+        time.sleep(0.5)
+
+
 def main():
     # Argument parser
     parser = argparse.ArgumentParser(description="Wiki Crawler Script")
@@ -187,20 +217,25 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        required=True,
-        help="The name of the output plain text file (e.g., 'output.txt').",
+        default=os.getcwd(),
+        help="The output folder to store files (default: current working directory).",
     )
 
     args = parser.parse_args()
+
+    # Validate and process the output folder
+    output_folder = args.output
+    validate_output_folder(output_folder)
 
     # Initialize global queue with starting category pages
     global queue
     queue = fetch_category_pages(args.category)
 
     # Crawl the wiki and save results
-    crawl_wiki(args.output)
+    crawl_wiki(output_folder)
 
-    print(f"Data saved to {args.output}")
+    print(f"Data saved to files in '{output_folder}'.")
+
 
 if __name__ == "__main__":
     main()
