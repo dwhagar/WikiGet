@@ -17,7 +17,9 @@ CATEGORY_BLACKLIST = [
     "Sources of Inspiration",
     "Star Trek",
     "Star Wars",
-    "Talk Pages"
+    "Talk Pages",
+    "Denied or Banned",
+    "Unapproved"
 ]  # Add blacklist categories here
 PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
 visited = set()
