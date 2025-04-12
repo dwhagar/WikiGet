@@ -1,12 +1,11 @@
-# Answer to your question: The script is already well structured and modularized. If you wish to expand functionality,
-# you could break out a separate function for page validation or combine fetch operations in one helper, but in general,
-# everything is adequately broken down.
-
-import os  # OS for directory checks
+import os
+import re
 import requests
 import argparse
-import re  # For sanitizing filenames
-from tqdm import tqdm  # Progress bar
+import json
+from datetime import datetime
+from rich.progress import Progress
+from rich.console import Console
 
 # Global Variables
 WIKI_URL = "https://wiki.moltenaether.com/w/api.php"
@@ -20,90 +19,58 @@ CATEGORY_BLACKLIST = [
     "Talk Pages",
     "Denied or Banned",
     "Unapproved"
-]  # Add blacklist categories here
+]
 PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
 visited = set()
 queue = []
 total_pages = 0
-processed_pages = 0
 
+console = Console(log_time=True, log_path=False)
 
 def sanitize_filename(title: str) -> str:
-    """Sanitize a page title to be filename-compliant.
-
-    Replaces or removes invalid characters and truncates to a maximum length of 255.
-
-    Args:
-        title (str): The page title to sanitize.
-
-    Returns:
-        str: A sanitized version of the title suitable for use as a filename.
     """
-    # Replace invalid filename characters with a space and limit length to 255
+    Sanitize a page title to be filename-compliant by removing or replacing invalid
+    characters and truncating to a maximum length of 255.
+    """
     return re.sub(r'[<>:"/\\|?*]', ' ', title)[:255]
 
 
-def validate_output_folder(output_folder: str) -> None:
-    """Validate that the specified output folder exists and is writable.
-
-    Args:
-        output_folder (str): The path to the output folder.
-
-    Raises:
-        SystemExit: If the folder does not exist or is not writable.
+def fetch_wiki_name() -> str:
     """
-    if not os.path.exists(output_folder):
-        print(f"The specified folder '{output_folder}' does not exist.")
-        exit(1)
-    if not os.access(output_folder, os.W_OK):
-        print(f"The specified folder '{output_folder}' is not writable.")
-        exit(1)
-
-
-def fetch_category_pages(category: str) -> list:
-    """Fetch all pages under a specified wiki category.
-
-    Args:
-        category (str): The name of the category to crawl.
+    Fetch the wiki's site name from the API.
 
     Returns:
-        list: A list of page titles found in that category.
+        str: The wiki site name, or 'UnknownWiki' if not found.
     """
-    pages = []
-    cmcontinue = None
-
-    # Reuse params dict for efficiency
     params = {
         "action": "query",
-        "list": "categorymembers",
-        "cmtitle": f"Category:{category}",
+        "meta": "siteinfo",
+        "siprop": "general",
         "format": "json",
-        "cmlimit": "max",
-        "apfilterredir": "nonredirects"  # Ignore redirect pages
     }
-
     if API_KEY:
         params["apikey"] = API_KEY
 
-    while True:
-        if cmcontinue:
-            params["cmcontinue"] = cmcontinue
+    try:
+        response = requests.get(WIKI_URL, params=params, timeout=30)
+        if response.status_code != 200:
+            print(f"Error fetching wiki name: HTTP {response.status_code}")
+            return "UnknownWiki"
+        data = response.json()
+
+        if "query" in data and "general" in data["query"] and "sitename" in data["query"]["general"]:
+            return data["query"]["general"]["sitename"]
         else:
-            params.pop("cmcontinue", None)
-
-        response = requests.get(WIKI_URL, params=params).json()
-        if "query" in response:
-            pages.extend(member["title"] for member in response["query"]["categorymembers"])
-
-        cmcontinue = response.get("continue", {}).get("cmcontinue")
-        if not cmcontinue:
-            break
-
-    return pages
+            print("Could not find 'sitename' in the siteinfo response.")
+            return "UnknownWiki"
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching wiki name: {e}")
+        return "Wiki"
 
 
 def fetch_all_pages() -> list:
-    """Fetch all non-redirect pages on the wiki.
+    """
+    Fetch all non-redirect pages on the wiki.
 
     Returns:
         list: A list of all non-redirect page titles.
@@ -117,7 +84,7 @@ def fetch_all_pages() -> list:
         "list": "allpages",
         "format": "json",
         "aplimit": "max",
-        "apfilterredir": "nonredirects"  # Ignore redirect pages
+        "apfilterredir": "nonredirects"
     }
 
     if API_KEY:
@@ -129,13 +96,24 @@ def fetch_all_pages() -> list:
         else:
             params.pop("apcontinue", None)
 
-        response = requests.get(WIKI_URL, params=params).json()
-        pages = response["query"]["allpages"]
+        try:
+            response = requests.get(WIKI_URL, params=params, timeout=30)
+            if response.status_code != 200:
+                print(f"Error fetching all pages: HTTP {response.status_code}")
+                break
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching all pages: {e}")
+            break
 
-        for page in pages:
+        if "query" not in data or "allpages" not in data["query"]:
+            print("Unexpected response structure when fetching all pages.")
+            break
+
+        for page in data["query"]["allpages"]:
             all_pages.append(page["title"])
 
-        apcontinue = response.get("continue", {}).get("apcontinue")
+        apcontinue = data.get("continue", {}).get("apcontinue")
         if not apcontinue:
             break
 
@@ -143,232 +121,266 @@ def fetch_all_pages() -> list:
     return all_pages
 
 
-def fetch_page_categories(title: str) -> list:
-    """Fetch categories for a specific wiki page.
+def build_page_url(page_title: str) -> str:
+    """
+    Build the URL for a wiki page from its title.
+    """
+    import urllib.parse
+    encoded_title = urllib.parse.quote(page_title.replace(' ', '_'))
+    return f"{WIKI_URL.replace('/api.php', '')}/index.php?title={encoded_title}"
 
-    Args:
-        title (str): The title of the wiki page.
+
+def fetch_page_data(title: str) -> dict:
+    """
+    Fetch the wiki text content, categories, and links for a specific page in a single call.
+    Distinguishes between a failing fetch and a valid page that happens to have no text.
 
     Returns:
-        list: A list of category titles for the given page.
+        {
+          "content": <str or None>,
+          "categories": <list[str]>,
+          "links": <list[str]>,
+          "fetch_error": <bool>
+        }
     """
-    params = {
-        "action": "query",
-        "titles": title,
-        "prop": "categories",
-        "format": "json",
+    data = {
+        "content": None,
+        "categories": [],
+        "links": [],
+        "fetch_error": False,
     }
-    if API_KEY:
-        params["apikey"] = API_KEY
 
-    response = requests.get(WIKI_URL, params=params).json()
-    pages_data = response.get("query", {}).get("pages", {})
-    categories = []
-
-    for _, page_info in pages_data.items():
-        if "categories" in page_info:
-            categories = [cat["title"] for cat in page_info["categories"]]
-
-    return categories
-
-
-def fetch_page_content(title: str) -> str:
-    """Fetch the wikitext content of a given wiki page.
-
-    Args:
-        title (str): The title of the wiki page.
-
-    Returns:
-        str: The page's content wrapped with a title header, or None if not found.
-    """
-    global processed_pages
     params = {
         "action": "query",
         "titles": title,
-        "prop": "revisions",
+        "prop": "revisions|categories|links",
         "rvprop": "content",
-        "format": "json",
-        "apfilterredir": "nonredirects"  # Ignore redirect pages
-    }
-    if API_KEY:
-        params["apikey"] = API_KEY
-
-    response = requests.get(WIKI_URL, params=params).json()
-    pages_data = response.get("query", {}).get("pages", {})
-
-    for _, page_info in pages_data.items():
-        if "revisions" in page_info:
-            content = page_info["revisions"][0].get("*")
-            processed_pages += 1
-            return f"= {title} =\n\n{content}"
-
-    return None
-
-
-def fetch_page_links(title: str) -> list:
-    """Fetch all wiki page links from a specific page.
-
-    Args:
-        title (str): The title of the wiki page.
-
-    Returns:
-        list: A list of linked page titles.
-    """
-    links = []
-    plcontinue = None
-
-    params = {
-        "action": "query",
-        "titles": title,
-        "prop": "links",
-        "format": "json",
+        "cllimit": "max",
         "pllimit": "max",
+        "format": "json",
+        "apfilterredir": "nonredirects"
     }
     if API_KEY:
         params["apikey"] = API_KEY
 
-    while True:
-        if plcontinue:
-            params["plcontinue"] = plcontinue
-        else:
-            params.pop("plcontinue", None)
+    try:
+        response = requests.get(WIKI_URL, params=params, timeout=30)
+        if response.status_code != 200:
+            print(f"Error fetching page data for '{title}': HTTP {response.status_code}")
+            data["fetch_error"] = True
+            return data
 
-        response = requests.get(WIKI_URL, params=params).json()
-        pages_data = response.get("query", {}).get("pages", {})
+        json_data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching page data for '{title}': {e}")
+        data["fetch_error"] = True
+        return data
 
-        for _, page_info in pages_data.items():
-            if "links" in page_info:
-                for link in page_info["links"]:
-                    link_title = link["title"]
-                    # Skip if any blacklisted prefix is found
-                    if not any(blacklist.lower() in link_title.lower() for blacklist in PAGE_BLACKLIST):
-                        links.append(link_title)
+    if "query" not in json_data or "pages" not in json_data["query"]:
+        print(f"Unexpected structure for page '{title}' data.")
+        data["fetch_error"] = True
+        return data
 
-        plcontinue = response.get("continue", {}).get("plcontinue")
-        if not plcontinue:
-            break
+    pages = json_data["query"]["pages"]
+    for _, page_info in pages.items():
+        if "revisions" in page_info:
+            revision = page_info["revisions"][0]
+            data["content"] = revision.get("*", "")
 
-    return links
+        if "categories" in page_info:
+            data["categories"] = [cat["title"] for cat in page_info["categories"]]
+
+        if "links" in page_info:
+            raw_links = [lk["title"] for lk in page_info["links"]]
+            filtered_links = []
+            for l in raw_links:
+                if not any(prefix.lower() in l.lower() for prefix in PAGE_BLACKLIST):
+                    filtered_links.append(l)
+            data["links"] = filtered_links
+
+    return data
 
 
-def crawl_wiki(output_folder: str, recursive: bool, no_overwrite: bool) -> None:
-    """Crawl the wiki based on queued page titles and save each page to disk.
-
-    Args:
-        output_folder (str): Path to the folder where pages will be saved.
-        recursive (bool): Whether to continue crawling via each page's links.
-        no_overwrite (bool): If True, skip pages that already exist on disk.
+def crawl_wiki(
+    recursive: bool,
+    max_retries: int = 5,
+    verbose: bool = False
+) -> dict:
     """
-    global processed_pages
-    progress_bar = tqdm(total=total_pages, desc="Processing Pages", unit="page")
+    Crawl the wiki pages in the global queue, building a JSON structure.
 
-    while queue:
-        title = queue.pop(0)
-        sanitized_title = sanitize_filename(title)
-        file_name = os.path.join(output_folder, f"{sanitized_title}.txt")
+    If fetch_error=True => re-queue up to max_retries times.
+    If fetch_error=False => treat as successful, even if 'content' is empty
+                           (some pages have categories/links but no text).
 
-        # Skip if file exists and no-overwrite is true
-        if no_overwrite and os.path.exists(file_name):
-            tqdm.write(f"Skipping existing file: {title}")
-            progress_bar.update(1)
-            continue
+    Returns a dict:
+      {
+        "pages": [...],
+        "categories": {...}
+      }
+    """
 
-        # Skip if already visited or blacklisted
-        if title in visited or any(blacklist.lower() in title.lower() for blacklist in PAGE_BLACKLIST):
-            tqdm.write(f"Skipping page: {title}")
-            progress_bar.update(1)
-            continue
+    pages_info = []
+    category_map = {}
+    page_retries = {}
 
-        visited.add(title)
+    with Progress(console=console) as progress:
+        task = progress.add_task("[cyan]Processing pages...", total=total_pages)
 
-        # Fetch categories and skip if none or blacklisted
-        categories = fetch_page_categories(title)
-        if not categories:
-            tqdm.write(f"Skipping page {title} due to no categories.")
-            progress_bar.update(1)
-            continue
-        if any(blacklist.lower() in category.lower() for blacklist in CATEGORY_BLACKLIST for category in categories):
-            tqdm.write(f"Skipping page {title} due to blacklisted category.")
-            progress_bar.update(1)
-            continue
+        while queue:
+            title = queue.pop(0)
 
-        tqdm.write(f"Processing: {title}")
-        content = fetch_page_content(title)
-        if content:
-            with open(file_name, "w", encoding="utf-8") as f:
-                f.write(content)
+            if title not in page_retries:
+                page_retries[title] = 0
 
+            # Skip if visited or blacklisted
+            if title in visited or any(prefix.lower() in title.lower() for prefix in PAGE_BLACKLIST):
+                if verbose:
+                    progress.log(f"[yellow]Skipping page:[/] {title}", highlight=False)
+                progress.update(task, advance=1)
+                continue
+
+            page_data = fetch_page_data(title)
+
+            # If the fetch truly failed, try again up to max_retries
+            if page_data["fetch_error"]:
+                page_retries[title] += 1
+                if page_retries[title] < max_retries:
+                    if verbose:
+                        progress.log(
+                            f"[red]Fetch error for:[/] {title} "
+                            f"(retry {page_retries[title]} of {max_retries}), re-queueing...",
+                            highlight=False
+                        )
+                    queue.append(title)
+                else:
+                    if verbose:
+                        progress.log(
+                            f"[red]Fetch error for:[/] {title} "
+                            f"({max_retries} retries exceeded), skipping...",
+                            highlight=False
+                        )
+                progress.update(task, advance=1)
+                continue
+
+            # Mark visited
+            visited.add(title)
+
+            content = page_data["content"]
+            categories = page_data["categories"]
+            links = page_data["links"]
+
+            # Check category blacklist
+            blacklisted = any(
+                black_cat.lower() in cat.lower()
+                for black_cat in CATEGORY_BLACKLIST
+                for cat in categories
+            )
+            if blacklisted:
+                if verbose:
+                    progress.log(
+                        f"[yellow]Skipping page due to blacklisted category:[/] {title}",
+                        highlight=False
+                    )
+                progress.update(task, advance=1)
+                continue
+
+            # Build page record
+            page_record = {
+                "title": title,
+                "url": build_page_url(title),
+                "content": content,
+                "categories": categories,
+                "links": links
+            }
+            pages_info.append(page_record)
+
+            # Update category map
+            for cat in categories:
+                if cat not in category_map:
+                    category_map[cat] = []
+                category_map[cat].append(title)
+
+            # If recursive, add links to the queue
             if recursive:
-                # If recursive, fetch links from the page and add them to the queue
-                links = fetch_page_links(title)
-                for link in links:
-                    if link not in visited and link not in queue:
-                        queue.append(link)
+                for link_title in links:
+                    if link_title not in visited and link_title not in queue and link_title != title:
+                        queue.append(link_title)
 
-        progress_bar.update(1)
+            if verbose:
+                progress.log(f"[green]Processing:[/] {title}", highlight=False)
 
-    progress_bar.close()
+            progress.update(task, advance=1)
 
-
-def merge_text_files(output_folder: str) -> None:
-    """Merge all .txt files in the output folder into a single file named 'wiki-data.txt'.
-
-    Args:
-        output_folder (str): Path to the folder containing .txt files.
-    """
-    merged_file_path = os.path.join(output_folder, "wiki-data.txt")
-
-    txt_files = [
-        f for f in os.listdir(output_folder)
-        if f.endswith(".txt") and f != "wiki-data.txt"
-    ]
-
-    with open(merged_file_path, "w", encoding="utf-8") as outfile:
-        for txt_file in txt_files:
-            file_path = os.path.join(output_folder, txt_file)
-            with open(file_path, "r", encoding="utf-8") as infile:
-                outfile.write(infile.read())
-                outfile.write("\n")
+    return {
+        "pages": pages_info,
+        "categories": category_map
+    }
 
 
 def main() -> None:
-    """Parse command-line arguments, then crawl the wiki and merge text files."""
-    parser = argparse.ArgumentParser(description="Wiki Crawler Script")
+    """
+    Produce a single JSON file named '[wiki_name] Data [YYYY-MM-DD].json' by default.
+    Distinguishes between true fetch errors vs blank pages that have categories/links.
+
+    Steps:
+      1) Determine wiki name (override with --wiki-name if set).
+      2) Fetch all non-redirect pages & crawl them, building a structured JSON.
+      3) Write the JSON to a file, default named after the wiki & today's date.
+      4) -v/--verbose logs each page's status; otherwise only the progress bar is shown.
+    """
+    parser = argparse.ArgumentParser(description="Wiki Crawler to JSON")
+
     parser.add_argument(
-        "-c", "--category", help="The category to crawl. If omitted, fetches all pages.",
+        "-o", "--output",
+        help="Path for the output JSON file. If omitted, defaults to '[WikiName] Data [YYYY-MM-DD].json'.",
+        default=None
     )
     parser.add_argument(
-        "-o", "--output", default=os.getcwd(),
-        help="Output folder to store files (default: current working directory).",
+        "-w", "--wiki-name",
+        help="Override the wiki name in the JSON data. By default, the script fetches from siteinfo.",
     )
     parser.add_argument(
-        "-n", "--no-overwrite", action="store_true",
-        help="Skip downloading pages that already exist in the output folder.",
+        "-v", "--verbose", action="store_true",
+        help="If set, log each page's download/skip message. Otherwise, only show progress bar."
     )
 
     args = parser.parse_args()
 
-    # Validate output folder
-    output_folder = args.output
-    validate_output_folder(output_folder)
+    global queue, visited, total_pages
+    visited.clear()
+    queue.clear()
 
-    # Determine if we should be recursive based on category usage
-    global queue
-    recursive = True
-    if args.category:
-        queue = fetch_category_pages(args.category)
+    # 1) Wiki name
+    if args.wiki_name:
+        wiki_name = args.wiki_name
     else:
-        print("No category specified. Fetching all pages.")
-        queue = fetch_all_pages()
-        recursive = False
+        wiki_name = fetch_wiki_name()
 
-    # Crawl the wiki
-    crawl_wiki(output_folder, recursive, args.no_overwrite)
+    # 2) Build default output name if none is given
+    if not args.output:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        safe_wiki_name = sanitize_filename(wiki_name)
+        args.output = f"{safe_wiki_name} Data {date_str}.json"
 
-    # Merge all text files
-    merge_text_files(output_folder)
+    # 3) Fetch & crawl pages
+    queue = fetch_all_pages()
+    data = crawl_wiki(recursive=True, max_retries=5, verbose=args.verbose)
+    data["wiki_name"] = wiki_name
 
-    print(f"Data saved to files in '{output_folder}'. Also merged into 'wiki-data.txt'.")
+    # 4) Write JSON
+    output_path = args.output
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir) and output_dir != '':
+        print(f"Output folder '{output_dir}' does not exist.")
+        exit(1)
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"Data saved to JSON file: {output_path}")
+    except OSError as e:
+        print(f"Error writing to file '{output_path}': {e}")
 
 
 if __name__ == "__main__":
