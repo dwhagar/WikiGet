@@ -18,6 +18,8 @@ CATEGORY_BLACKLIST = [
     "Talk Pages", "Denied or Banned", "Unapproved"
 ]
 PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
+LLM_MODEL = "all-MiniLM-L6-v2"
+LLM_VECTOR_ROUND = 3
 max_workers = round(os.cpu_count() * 0.83)
 visited = set()
 queue = []
@@ -27,7 +29,7 @@ total_pages = 0
 console.log("[blue]Loading embedding model (all-MiniLM-L6-v2)...")
 from sentence_transformers import SentenceTransformer
 from keybert import KeyBERT
-EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+EMBED_MODEL = SentenceTransformer(LLM_MODEL)
 KEYBERT_MODEL = KeyBERT(model=EMBED_MODEL)
 
 # --- Utilities ---
@@ -246,19 +248,21 @@ def crawl_wiki(pages: list, verbose=False) -> list:
 
 # --- Phase 2: Enrich ---
 
-def generate_embedding(text: str) -> list:
-    return EMBED_MODEL.encode(text).tolist()
+def generate_embedding(text: str, decimals=3) -> list:
+    raw_vector = EMBED_MODEL.encode(text)
+    # Convert each float in `raw_vector` to a rounded float
+    return [round(float(v), decimals) for v in raw_vector]
 
 def extract_keywords(text: str) -> list:
     keywords = KEYBERT_MODEL.extract_keywords(text, keyphrase_ngram_range=(1, 3), stop_words="english", use_maxsum=True, top_n=10)
     return [kw for kw, _ in keywords]
 
 def enrich_page(page: dict) -> dict:
-    page["summary_embedding"] = generate_embedding(page["summary"])
+    page["summary_embedding"] = generate_embedding(page["summary"], decimals=LLM_VECTOR_ROUND)
     for section in page["sections"]:
-        section["embedding"] = generate_embedding(section["content"])
+        section["embedding"] = generate_embedding(section["content"], decimals=LLM_VECTOR_ROUND)
         for subsection in section.get("subsections", []):
-            subsection["embedding"] = generate_embedding(subsection["content"])
+            subsection["embedding"] = generate_embedding(subsection["content"], decimals=LLM_VECTOR_ROUND)
     page["keywords"] = extract_keywords(page["raw_text"])
     del page["raw_text"]
     return page
@@ -305,8 +309,8 @@ def main():
     output = {
         "wiki_name": wiki_name,
         "content_format": "wikitext",
-        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-        "keyword_model": "keybert with all-MiniLM-L6-v2",
+        "embedding_model": LLM_MODEL,
+        "keyword_model": "keybert with " + LLM_MODEL,
         "pages": enriched_data,
         "categories": {}
     }
