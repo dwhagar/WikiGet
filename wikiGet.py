@@ -4,16 +4,13 @@ import json
 import requests
 import argparse
 import numpy as np
-import signal
 import time
+import torch
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 from datetime import datetime
 from rich.console import Console
-from multiprocessing import Pool
 from collections import defaultdict
-from collections import deque
-from rich.text import Text
 from rich.progress import (
     Progress,
     TextColumn,
@@ -56,7 +53,13 @@ LLM_VECTOR_ROUND = 0 # 0 to disable rounding
 # Console and constants
 console = Console(log_time=True, log_path=False)
 os.environ["LOKY_MAX_CPU_COUNT"] = str(os.cpu_count())
-max_workers = round(os.cpu_count() * 0.75)
+max_workers = round(os.cpu_count() * 0.6)
+
+# Limit one thread-pool per process (we keep only one process now)
+torch.set_num_threads(max_workers)               # PyTorch kernels
+os.environ["OMP_NUM_THREADS"]  = str(max_workers)  # OpenMP
+os.environ["MKL_NUM_THREADS"]  = str(max_workers)  # Intel MKL (fallback)
+
 visited = set()
 queue = []
 total_pages = 0
@@ -105,33 +108,6 @@ def _get_item_title(obj: dict | str) -> str:
     if isinstance(obj, dict):
         return obj.get("*") or obj.get("title") or obj.get("name") or ""
     return str(obj)
-
-class SmoothedTimeRemainingColumn(TimeRemainingColumn):
-    """
-    Drop-in replacement for TimeRemainingColumn that averages completion
-    rate over the last *window* refreshes to give a steadier ETA.
-    """
-    def __init__(self, window: int = 20):
-        super().__init__()
-        self.window = window
-        self._samples: deque[tuple[int, float]] = deque(maxlen=window)
-
-    def render(self, task):
-        self._samples.append((task.completed, task.elapsed))
-        if len(self._samples) < 2 or task.finished:
-            return super().render(task)
-
-        done0, t0 = self._samples[0]
-        done1, t1 = self._samples[-1]
-        delta_done = done1 - done0
-        delta_t = t1 - t0
-
-        if delta_done <= 0 or delta_t <= 0:
-            return super().render(task)
-
-        rate = delta_done / delta_t
-        remaining_seconds = (task.total - task.completed) / rate
-        return Text(self.format_time(remaining_seconds), style=self.style) # type: ignore[attr-defined]
 
 # --- Parser ---
 
@@ -618,9 +594,6 @@ def main():
     raw_data = crawl_wiki(verbose=args.verbose)
 
     # Step 2: Enrich pages
-    # Set SIGINT to default so parent can interrupt children cleanly
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
     enriched_pages = []
 
     with Progress(
@@ -628,25 +601,19 @@ def main():
             BarColumn(),
             TaskProgressColumn(),
             TimeElapsedColumn(),
-            SmoothedTimeRemainingColumn(window=30),  # steadier ETA
+            TimeRemainingColumn(),  # stock ETA
             console=console,
-            refresh_per_second=4,  # fewer redraws, less jitter
+            refresh_per_second=4
     ) as progress:
-        task = progress.add_task("Enriching pages…", total=len(raw_data["pages"]))
+        task = progress.add_task("Enriching pages...", total=len(raw_data["pages"]))
 
-        try:
-            with Pool(processes=args.workers or max(1, max_workers)) as pool:
-                for result in pool.imap(enrich_page, raw_data["pages"], chunksize=4):
-                    if args.verbose:
-                        progress.log(f"[green]Enriched:[/] {result['title']}", highlight=False)
+        for page in raw_data["pages"]:
+            result = enrich_page(page)
+            if args.verbose:
+                progress.log(f"[green]Enriched:[/] {result['title']}", highlight=False)
 
-                    enriched_pages.append(result)
-                    progress.update(task, advance=1)
-        except KeyboardInterrupt:
-            console.log("[red]Interrupted by user. Cleaning up pool...")
-            pool.terminate()
-            pool.join()
-            exit(1)
+            enriched_pages.append(result)
+            progress.update(task, advance=1)
 
     # Step 3–7: Clustering, labeling, and similarity
     flat_sections, section_embeddings = extract_all_section_embeddings(enriched_pages)
@@ -685,7 +652,6 @@ def main():
         json.dump(final_data, f, ensure_ascii=False, indent=2)
 
     console.log(f"[green]Final data saved to: {output_path}")
-
 
 if __name__ == "__main__":
     start_time = time.time()
