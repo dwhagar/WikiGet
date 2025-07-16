@@ -1,24 +1,48 @@
+# ────────────────────────── Standard library ──────────────────────────
+import argparse
+import json
 import os
 import re
-import json
-import requests
-import argparse
-import numpy as np
 import time
+from collections import defaultdict
+from datetime import datetime
+from typing import Optional
+
+# ───────────────────────── Third-party packages ────────────────────────
+import numpy as np
+import requests
 import torch
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
-from datetime import datetime
 from rich.console import Console
-from collections import defaultdict
 from rich.progress import (
     Progress,
     TextColumn,
     BarColumn,
     TaskProgressColumn,
     TimeElapsedColumn,
-    TimeRemainingColumn
+    TimeRemainingColumn,   # superclass for our EMA column
 )
+from rich.text import Text
+from sentence_transformers import SentenceTransformer
+from keybert import KeyBERT
+# noinspection PyUnresolvedReferences
+from keybert._maxsum import max_sum_distance
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ──────────────────────── Rich < 10 fallback ───────────────────────────
+try:
+    from rich.progress import format_time  # Rich ≥ 10
+except ImportError:                        # pragma: no cover
+    def format_time(seconds: float | None) -> str:  # noqa: E302
+        if seconds is None or seconds == float("inf"):
+            return "--:--:--"
+        seconds = int(seconds + 0.5)
+        h, rmdr = divmod(seconds, 3600)
+        m, s   = divmod(rmdr, 60)
+        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 # Global Variables
 WIKI_URL = "https://wiki.moltenaether.com/w/api.php"
@@ -49,6 +73,8 @@ PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
 # implemented a rounding to 3 places to help reduce file size.
 LLM_MODEL = "all-mpnet-base-v2"
 LLM_VECTOR_ROUND = 0 # 0 to disable rounding
+EMBED_MODEL = SentenceTransformer(LLM_MODEL)
+KEYBERT_MODEL = KeyBERT(model=EMBED_MODEL)
 
 # Console and constants
 console = Console(log_time=True, log_path=False)
@@ -63,18 +89,6 @@ os.environ["MKL_NUM_THREADS"]  = str(max_workers)  # Intel MKL (fallback)
 visited = set()
 queue = []
 total_pages = 0
-
-# Load models
-# console.log(f"[blue]Loading embedding model ({LLM_MODEL})...")
-from sentence_transformers import SentenceTransformer
-from keybert import KeyBERT
-# noinspection PyUnresolvedReferences
-from keybert._maxsum import max_sum_distance
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-EMBED_MODEL = SentenceTransformer(LLM_MODEL)
-KEYBERT_MODEL = KeyBERT(model=EMBED_MODEL)
 
 # --- Utilities ---
 
@@ -108,6 +122,30 @@ def _get_item_title(obj: dict | str) -> str:
     if isinstance(obj, dict):
         return obj.get("*") or obj.get("title") or obj.get("name") or ""
     return str(obj)
+
+class EMATimeRemainingColumn(TimeRemainingColumn):
+    """ETA column with exponential moving-average smoothing."""
+    def __init__(self, alpha: float = 0.1):
+        super().__init__()
+        self.alpha = alpha
+        self._ema_rate: Optional[float] = None  # items/sec
+
+    def render(self, task):
+        if task.completed == 0 or task.elapsed is None:
+            return super().render(task)
+
+        inst_rate = task.completed / task.elapsed if task.elapsed else 0
+        self._ema_rate = (
+            inst_rate if self._ema_rate is None
+            else self.alpha * inst_rate + (1 - self.alpha) * self._ema_rate
+        )
+
+        if not self._ema_rate:
+            return super().render(task)
+
+        remaining = (task.total - task.completed) / self._ema_rate
+        style_kw = {"style": self.style} if hasattr(self, "style") else {}
+        return Text(format_time(remaining), **style_kw)
 
 # --- Parser ---
 
@@ -333,16 +371,6 @@ def fetch_page_data(title: str) -> dict:
 # --- Phase 1: Crawl ---
 
 def crawl_wiki(pages: list = None, verbose: bool = False) -> dict:
-    """
-    Crawl wiki pages and return structured raw data.
-    If no pages are passed in, fetches all non-redirect titles.
-
-    Returns:
-        dict with keys:
-          - 'pages': list of fetched usable page dicts
-          - 'categories': dict of category -> [titles]
-          - 'wiki_name': str
-    """
     if pages is None:
         pages = fetch_all_pages()
 
@@ -350,8 +378,17 @@ def crawl_wiki(pages: list = None, verbose: bool = False) -> dict:
     category_map = {}
     wiki_name = fetch_wiki_name()
 
-    with Progress(console=console) as progress:
-        task = progress.add_task("[cyan]Processing pages...", total=len(pages), highlight=False)
+    # --- Progress bar for page fetching -------------------------------------
+    with Progress(
+            TextColumn("[cyan]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            EMATimeRemainingColumn(alpha=0.2),     # same steady ETA
+            console=console,
+            refresh_per_second=3,                 # same refresh rate
+    ) as progress:
+        task = progress.add_task("Processing pages...", total=len(pages))
 
         for title in pages:
             data = fetch_page_data(title)
@@ -372,7 +409,7 @@ def crawl_wiki(pages: list = None, verbose: bool = False) -> dict:
             output_pages.append(data)
             visited.add(title)
 
-            # Update category map
+            # update category map
             for cat in data.get("categories", []):
                 category_map.setdefault(cat, []).append(title)
 
@@ -414,33 +451,25 @@ def get_top_n_similar(index: int, similarity_matrix: np.ndarray, titles: list[st
     return results
 
 def extract_all_section_embeddings(data: list[dict]) -> tuple[list[dict], list[list[float]]]:
-    """
-    Flattens all sections across all pages into a list, and extracts their embeddings.
-    Each returned section includes:
-      - `page_title`
-      - `section_title`
-      - `title` (combined for similarity labels)
-      - `semantic_embedding`
-      - `ref` to original section object (for modifying)
-    """
     flat_sections = []
     embeddings = []
 
     for page in data:
         page_title = page["title"]
         for section in page.get("sections", []):
+            if "semantic_embedding" not in section:
+                continue                    # skip short sections
+
             section_title = section.get("heading", "Unnamed Section")
             full_label = f"{page_title} - {section_title}"
 
-            flat_section = {
+            flat_sections.append({
                 "page_title": page_title,
                 "section_title": section_title,
-                "title": full_label,  # Used for related_pages
+                "title": full_label,
                 "semantic_embedding": section["semantic_embedding"],
-                "ref": section  # backref for assignment
-            }
-
-            flat_sections.append(flat_section)
+                "ref": section,
+            })
             embeddings.append(section["semantic_embedding"])
 
     return flat_sections, embeddings
@@ -601,9 +630,9 @@ def main():
             BarColumn(),
             TaskProgressColumn(),
             TimeElapsedColumn(),
-            TimeRemainingColumn(),  # stock ETA
+            EMATimeRemainingColumn(alpha=0.2),  # steadier ETA
             console=console,
-            refresh_per_second=4
+            refresh_per_second=3,  # redraw every 0.33 s
     ) as progress:
         task = progress.add_task("Enriching pages...", total=len(raw_data["pages"]))
 
