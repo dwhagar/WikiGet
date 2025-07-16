@@ -96,6 +96,43 @@ def html_to_markdown(html: str) -> str:
     """
     return md(html, heading_style="ATX", strip=['style', 'script']).strip()
 
+def _get_item_title(obj: dict | str) -> str:
+    """
+    MediaWiki v1 ⇒   {'*': 'Foo'}
+    MediaWiki v2 ⇒   {'title': 'Foo'}  or {'name': 'Foo'}
+    Accept either form. Falls back to str(obj) for robustness.
+    """
+    if isinstance(obj, dict):
+        return obj.get("*") or obj.get("title") or obj.get("name") or ""
+    return str(obj)
+
+class SmoothedTimeRemainingColumn(TimeRemainingColumn):
+    """
+    Drop-in replacement for TimeRemainingColumn that averages completion
+    rate over the last *window* refreshes to give a steadier ETA.
+    """
+    def __init__(self, window: int = 20):
+        super().__init__()
+        self.window = window
+        self._samples: deque[tuple[int, float]] = deque(maxlen=window)
+
+    def render(self, task):
+        self._samples.append((task.completed, task.elapsed))
+        if len(self._samples) < 2 or task.finished:
+            return super().render(task)
+
+        done0, t0 = self._samples[0]
+        done1, t1 = self._samples[-1]
+        delta_done = done1 - done0
+        delta_t = t1 - t0
+
+        if delta_done <= 0 or delta_t <= 0:
+            return super().render(task)
+
+        rate = delta_done / delta_t
+        remaining_seconds = (task.total - task.completed) / rate
+        return Text(self.format_time(remaining_seconds), style=self.style) # type: ignore[attr-defined]
+
 # --- Parser ---
 
 def parse_html_into_summary_and_sections(html: str) -> dict:
@@ -275,8 +312,8 @@ def fetch_page_data(title: str) -> dict:
 
     parse = data["parse"]
     raw_html: str = parse.get("text", "")
-    categories = [c["*"] for c in parse.get("categories", [])]
-    links_raw = [l["*"] for l in parse.get("links", [])]
+    categories = [_get_item_title(c) for c in parse.get("categories", [])]
+    links_raw = [_get_item_title(l) for l in parse.get("links", [])]
 
     # Category blacklist
     if any(bc.lower() in c.lower() for bc in CATEGORY_BLACKLIST for c in categories):
@@ -303,33 +340,6 @@ def fetch_page_data(title: str) -> dict:
         "links":      links,
         "raw_text":   plain_text,
     }
-
-class SmoothedTimeRemainingColumn(TimeRemainingColumn):
-    """
-    Drop-in replacement for TimeRemainingColumn that averages completion
-    rate over the last *window* refreshes to give a steadier ETA.
-    """
-    def __init__(self, window: int = 20):
-        super().__init__()
-        self.window = window
-        self._samples: deque[tuple[int, float]] = deque(maxlen=window)
-
-    def render(self, task):
-        self._samples.append((task.completed, task.elapsed))
-        if len(self._samples) < 2 or task.finished:
-            return super().render(task)
-
-        done0, t0 = self._samples[0]
-        done1, t1 = self._samples[-1]
-        delta_done = done1 - done0
-        delta_t = t1 - t0
-
-        if delta_done <= 0 or delta_t <= 0:
-            return super().render(task)
-
-        rate = delta_done / delta_t
-        remaining_seconds = (task.total - task.completed) / rate
-        return Text(self.format_time(remaining_seconds), style=self.style) # type: ignore[attr-defined]
 
 # --- Phase 1: Crawl ---
 
