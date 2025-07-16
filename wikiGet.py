@@ -137,95 +137,108 @@ class SmoothedTimeRemainingColumn(TimeRemainingColumn):
 
 def parse_html_into_summary_and_sections(html: str) -> dict:
     """
-    Walk the rendered HTML and split it into:
-        summary      – content before the first <h2>
-        sections     – level-2 sections (<h2>)
-        subsections  – level-3 sections (<h3>) inside each section
+    Split rendered HTML into:
+        summary      : text before the first <h2> or <h3>
+        sections     : top-level <h2> blocks
+        subsections  : nested <h3> blocks inside each section
 
-    Returns:
-        {
-            "summary": str,
-            "sections": [
-                {
-                    "heading": str,
-                    "content": str,
-                    "subsections": [
-                        {"heading": str, "content": str},
-                        ...
-                    ]
-                },
-                ...
-            ]
-        }
+    Returned schema:
+    {
+        "summary": str,
+        "sections": [
+            {
+                "heading": str,
+                "content": str,
+                "subsections": [
+                    {"heading": str, "content": str},
+                    ...
+                ]
+            },
+            ...
+        ]
+    }
     """
     soup = BeautifulSoup(html, "html.parser")
     root = soup.find("div", class_="mw-parser-output") or soup
 
     result = {"summary": "", "sections": []}
-    current_section = None
-    current_subsection = None
+    current_section: dict | None = None
+    current_subsection: dict | None = None
 
     for node in root.children:
-        # Skip strings that are just whitespace
+        # skip pure whitespace strings
         if isinstance(node, str) and not node.strip():
             continue
 
-        tag_name = getattr(node, "name", None)
+        tag = getattr(node, "name", None)
 
-        # Handle headings
-        if tag_name in ("h2", "h3"):
+        # ── Headings ───────────────────────────────────────────────────────────
+        if tag in ("h2", "h3"):
             heading_text = node.get_text(separator=" ", strip=True)
-            level = 2 if tag_name == "h2" else 3
+            level = 2 if tag == "h2" else 3
 
-            if level == 2:
-                # Flush any open subsection
-                if current_subsection:
+            if level == 2:                          # new section
+                # flush an open subsection, if any
+                if current_subsection and current_section:
                     current_subsection["content"] = current_subsection["content"].strip()
                     current_section["subsections"].append(current_subsection)
                     current_subsection = None
 
-                # Flush previous section
+                # flush the previous section
                 if current_section:
                     current_section["content"] = current_section["content"].strip()
                     result["sections"].append(current_section)
 
-                # Start a new section
+                # start a clean section
                 current_section = {
                     "heading": heading_text,
                     "content": "",
                     "subsections": []
                 }
 
-            else:  # level 3
-                # Flush previous subsection
+            else: # new subsection (h3)
+                # if no section yet, create a placeholder
+                if current_section is None:
+                    current_section = {
+                        "heading": "Unnamed Section",
+                        "content": "",
+                        "subsections": []
+                    }
+
+                # flush previous subsection
                 if current_subsection:
                     current_subsection["content"] = current_subsection["content"].strip()
                     current_section["subsections"].append(current_subsection)
 
-                # Start a new subsection
+                # start subsection
                 current_subsection = {
                     "heading": heading_text,
                     "content": ""
                 }
 
-            # Move on to next node
-            continue
+            continue  # heading handled, move to next node
 
-        # Non-heading content
+        # ── Non-heading content ───────────────────────────────────────────────
         text_block = node.get_text(separator=" ", strip=True) if hasattr(node, "get_text") else str(node).strip()
         if not text_block:
             continue
 
-        if current_subsection:
+        if current_subsection is not None:
             current_subsection["content"] += text_block + "\n"
-        elif current_section:
+        elif current_section is not None:
             current_section["content"] += text_block + "\n"
         else:
             result["summary"] += text_block + "\n"
 
-    # Final flushes
+    # ── Final flushes ─────────────────────────────────────────────────────────
     if current_subsection:
         current_subsection["content"] = current_subsection["content"].strip()
+        if current_section is None:
+            current_section = {
+                "heading": "Unnamed Section",
+                "content": "",
+                "subsections": []
+            }
         current_section["subsections"].append(current_subsection)
 
     if current_section:
@@ -234,7 +247,7 @@ def parse_html_into_summary_and_sections(html: str) -> dict:
 
     result["summary"] = result["summary"].strip()
 
-    # Strip trailing whitespace in subsection contents
+    # trim subsection whitespace
     for sec in result["sections"]:
         for sub in sec["subsections"]:
             sub["content"] = sub["content"].strip()
