@@ -5,11 +5,23 @@ import requests
 import argparse
 import numpy as np
 import signal
+import time
+from bs4 import BeautifulSoup
+from markdownify import markdownify as md
 from datetime import datetime
 from rich.console import Console
-from rich.progress import Progress, track
 from multiprocessing import Pool
 from collections import defaultdict
+from collections import deque
+from rich.text import Text
+from rich.progress import (
+    Progress,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn
+)
 
 # Global Variables
 WIKI_URL = "https://wiki.moltenaether.com/w/api.php"
@@ -38,12 +50,13 @@ PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
 # These control the LLM model used for both keywords and embedding
 # doing this can increase the JSON file size by 5 to 20 times, so
 # implemented a rounding to 3 places to help reduce file size.
-LLM_MODEL = "all-MiniLM-L6-v2"
+LLM_MODEL = "all-mpnet-base-v2"
 LLM_VECTOR_ROUND = 0 # 0 to disable rounding
 
 # Console and constants
 console = Console(log_time=True, log_path=False)
-max_workers = round(os.cpu_count() * 0.83)
+os.environ["LOKY_MAX_CPU_COUNT"] = str(os.cpu_count())
+max_workers = round(os.cpu_count() * 0.75)
 visited = set()
 queue = []
 total_pages = 0
@@ -52,6 +65,8 @@ total_pages = 0
 # console.log(f"[blue]Loading embedding model ({LLM_MODEL})...")
 from sentence_transformers import SentenceTransformer
 from keybert import KeyBERT
+# noinspection PyUnresolvedReferences
+from keybert._maxsum import max_sum_distance
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
@@ -67,114 +82,126 @@ def build_page_url(title: str) -> str:
     import urllib.parse
     return f"{WIKI_URL.replace('/api.php', '')}/index.php?title=" + urllib.parse.quote(title.replace(" ", "_"))
 
+def html_to_plaintext(html: str) -> str:
+    """Remove tags/scripts and return readable plain text."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    return soup.get_text("\n", strip=True)
+
+def html_to_markdown(html: str) -> str:
+    """
+    Convert full HTML to Markdown.
+    Uses ATX headings so <h2> ➜ ##, <h3> ➜ ###, etc.
+    """
+    return md(html, heading_style="ATX", strip=['style', 'script']).strip()
+
 # --- Parser ---
 
-def parse_wiki_text_into_summary_and_sections(text: str) -> dict:
+def parse_html_into_summary_and_sections(html: str) -> dict:
     """
-    Parses wikitext into summary and section structure:
-    - summary = content before first heading
-    - sections = level-2 (==) headings
-    - subsections = level-3 (===) headings within a section
+    Walk the rendered HTML and split it into:
+        summary      – content before the first <h2>
+        sections     – level-2 sections (<h2>)
+        subsections  – level-3 sections (<h3>) inside each section
+
+    Returns:
+        {
+            "summary": str,
+            "sections": [
+                {
+                    "heading": str,
+                    "content": str,
+                    "subsections": [
+                        {"heading": str, "content": str},
+                        ...
+                    ]
+                },
+                ...
+            ]
+        }
     """
-    heading_regex = re.compile(r"^(={2,3})\s*(.*?)\s*\1\s*$", re.MULTILINE)
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.find("div", class_="mw-parser-output") or soup
+
     result = {"summary": "", "sections": []}
-    matches = list(heading_regex.finditer(text))
-    last_pos = 0
-
-    if matches:
-        result["summary"] = text[:matches[0].start()].strip()
-        last_pos = matches[0].start()
-    else:
-        result["summary"] = text.strip()
-        return result
-
     current_section = None
     current_subsection = None
 
-    for match in matches:
-        level = len(match.group(1))
-        heading = match.group(2).strip()
-        section_text = text[last_pos:match.start()]
-        last_pos = match.end()
+    for node in root.children:
+        # Skip strings that are just whitespace
+        if isinstance(node, str) and not node.strip():
+            continue
 
-        if level == 2:
-            # Finalize any open subsection
-            if current_subsection:
-                if current_section is None:
-                    current_section = {
-                        "heading": "Unnamed Section",
-                        "content": "",
-                        "subsections": []
-                    }
-                current_subsection["content"] = current_subsection["content"].strip()
-                current_section["subsections"].append(current_subsection)
-                current_subsection = None
+        tag_name = getattr(node, "name", None)
 
-            # Finalize current section
-            if current_section:
-                current_section["content"] = current_section["content"].strip()
-                result["sections"].append(current_section)
+        # Handle headings
+        if tag_name in ("h2", "h3"):
+            heading_text = node.get_text(separator=" ", strip=True)
+            level = 2 if tag_name == "h2" else 3
 
-            # Start new section
-            current_section = {
-                "heading": heading,
-                "content": "",
-                "subsections": []
-            }
+            if level == 2:
+                # Flush any open subsection
+                if current_subsection:
+                    current_subsection["content"] = current_subsection["content"].strip()
+                    current_section["subsections"].append(current_subsection)
+                    current_subsection = None
 
-        elif level == 3:
-            # Finalize previous subsection
-            if current_subsection:
-                if current_section is None:
-                    current_section = {
-                        "heading": "Unnamed Section",
-                        "content": "",
-                        "subsections": []
-                    }
-                current_subsection["content"] = current_subsection["content"].strip()
-                current_section["subsections"].append(current_subsection)
+                # Flush previous section
+                if current_section:
+                    current_section["content"] = current_section["content"].strip()
+                    result["sections"].append(current_section)
 
-            # Create new subsection
-            current_subsection = {
-                "heading": heading,
-                "content": ""
-            }
+                # Start a new section
+                current_section = {
+                    "heading": heading_text,
+                    "content": "",
+                    "subsections": []
+                }
 
-        # Append content to correct location
+            else:  # level 3
+                # Flush previous subsection
+                if current_subsection:
+                    current_subsection["content"] = current_subsection["content"].strip()
+                    current_section["subsections"].append(current_subsection)
+
+                # Start a new subsection
+                current_subsection = {
+                    "heading": heading_text,
+                    "content": ""
+                }
+
+            # Move on to next node
+            continue
+
+        # Non-heading content
+        text_block = node.get_text(separator=" ", strip=True) if hasattr(node, "get_text") else str(node).strip()
+        if not text_block:
+            continue
+
         if current_subsection:
-            current_subsection["content"] += section_text
+            current_subsection["content"] += text_block + "\n"
         elif current_section:
-            current_section["content"] += section_text
+            current_section["content"] += text_block + "\n"
         else:
-            result["summary"] += "\n" + section_text  # fallback
+            result["summary"] += text_block + "\n"
 
-    # Final trailing text
-    trailing_text = text[last_pos:].strip()
+    # Final flushes
     if current_subsection:
-        current_subsection["content"] += trailing_text
-        if current_section is None:
-            current_section = {
-                "heading": "Unnamed Section",
-                "content": "",
-                "subsections": []
-            }
+        current_subsection["content"] = current_subsection["content"].strip()
         current_section["subsections"].append(current_subsection)
-    elif current_section:
-        current_section["content"] += trailing_text
-    else:
-        result["summary"] += "\n" + trailing_text
 
-    # Final append
     if current_section:
         current_section["content"] = current_section["content"].strip()
         result["sections"].append(current_section)
 
-    # Tidy subsection content
+    result["summary"] = result["summary"].strip()
+
+    # Strip trailing whitespace in subsection contents
     for sec in result["sections"]:
         for sub in sec["subsections"]:
             sub["content"] = sub["content"].strip()
 
-    result["summary"] = result["summary"].strip()
     return result
 
 # --- Fetch ---
@@ -216,40 +243,93 @@ def fetch_wiki_name() -> str:
         return "UnknownWiki"
 
 def fetch_page_data(title: str) -> dict:
+    """
+    Retrieve a single wiki page as rendered HTML, convert it to Markdown,
+    extract plain-text for embeddings, and return the standard project schema.
+
+    Returns a dict with:
+        title, url, markdown, summary, sections, categories,
+        links, raw_text, and the usual blacklist / error flags.
+    """
+    # Title blacklist
     if any(prefix.lower() in title.lower() for prefix in PAGE_BLACKLIST):
         return {"title": title, "blacklisted": True}
 
     params = {
-        "action": "query", "titles": title, "prop": "revisions|categories|links",
-        "rvprop": "content", "cllimit": "max", "pllimit": "max", "format": "json"
+        "action": "parse",
+        "page": title,
+        "prop": "text|categories|links",
+        "format": "json",
+        "formatversion": 2,
     }
     if API_KEY:
         params["apikey"] = API_KEY
 
     try:
-        response = requests.get(WIKI_URL, params=params, timeout=30).json()
-    except:
+        data = requests.get(WIKI_URL, params=params, timeout=30).json()
+    except Exception:
         return {"title": title, "fetch_error": True}
 
-    pages = response.get("query", {}).get("pages", {})
-    for _, page in pages.items():
-        raw = page.get("revisions", [{}])[0].get("*", "")
-        parsed = parse_wiki_text_into_summary_and_sections(raw)
-        cats = [c["title"] for c in page.get("categories", [])]
-        if any(bc.lower() in c.lower() for bc in CATEGORY_BLACKLIST for c in cats):
-            return {"title": title, "blacklisted": True}
-        links = [l["title"] for l in page.get("links", []) if not any(p in l["title"] for p in PAGE_BLACKLIST)]
-        return {
-            "title": title,
-            "url": build_page_url(title),
-            "summary": parsed["summary"],
-            "sections": parsed["sections"],
-            "categories": cats,
-            "links": links,
-            "raw_text": raw
-        }
+    if "error" in data or "parse" not in data:
+        return {"title": title, "fetch_error": True}
 
-    return {"title": title, "fetch_error": True}
+    parse = data["parse"]
+    raw_html: str = parse.get("text", "")
+    categories = [c["*"] for c in parse.get("categories", [])]
+    links_raw = [l["*"] for l in parse.get("links", [])]
+
+    # Category blacklist
+    if any(bc.lower() in c.lower() for bc in CATEGORY_BLACKLIST for c in categories):
+        return {"title": title, "blacklisted": True}
+
+    # Convert formats
+    markdown = html_to_markdown(raw_html)
+    plain_text = html_to_plaintext(raw_html)
+    structure = parse_html_into_summary_and_sections(raw_html)
+
+    # Filter internal links
+    links = [
+        lt for lt in links_raw
+        if not any(p.lower() in lt.lower() for p in PAGE_BLACKLIST)
+    ]
+
+    return {
+        "title":      title,
+        "url":        build_page_url(title),
+        "markdown":   markdown,
+        "summary":    structure["summary"],
+        "sections":   structure["sections"],
+        "categories": categories,
+        "links":      links,
+        "raw_text":   plain_text,
+    }
+
+class SmoothedTimeRemainingColumn(TimeRemainingColumn):
+    """
+    Drop-in replacement for TimeRemainingColumn that averages completion
+    rate over the last *window* refreshes to give a steadier ETA.
+    """
+    def __init__(self, window: int = 20):
+        super().__init__()
+        self.window = window
+        self._samples: deque[tuple[int, float]] = deque(maxlen=window)
+
+    def render(self, task):
+        self._samples.append((task.completed, task.elapsed))
+        if len(self._samples) < 2 or task.finished:
+            return super().render(task)
+
+        done0, t0 = self._samples[0]
+        done1, t1 = self._samples[-1]
+        delta_done = done1 - done0
+        delta_t = t1 - t0
+
+        if delta_done <= 0 or delta_t <= 0:
+            return super().render(task)
+
+        rate = delta_done / delta_t
+        remaining_seconds = (task.total - task.completed) / rate
+        return Text(self.format_time(remaining_seconds), style=self.style) # type: ignore[attr-defined]
 
 # --- Phase 1: Crawl ---
 
@@ -315,7 +395,6 @@ def compute_cosine_similarity_matrix(embeddings: list[list[float]]) -> np.ndarra
     embedding_matrix = np.array(embeddings)
     return cosine_similarity(embedding_matrix)
 
-
 def get_top_n_similar(index: int, similarity_matrix: np.ndarray, titles: list[str], N: int) -> list[dict]:
     """
     Returns the top-N most similar items to the given index, excluding itself.
@@ -334,7 +413,6 @@ def get_top_n_similar(index: int, similarity_matrix: np.ndarray, titles: list[st
         if len(results) >= N:
             break
     return results
-
 
 def extract_all_section_embeddings(data: list[dict]) -> tuple[list[dict], list[list[float]]]:
     """
@@ -368,7 +446,6 @@ def extract_all_section_embeddings(data: list[dict]) -> tuple[list[dict], list[l
 
     return flat_sections, embeddings
 
-
 def cluster_sections(embeddings: list[list[float]], n_clusters: int = 20) -> list[int]:
     """
     Applies KMeans clustering to section embeddings.
@@ -376,7 +453,6 @@ def cluster_sections(embeddings: list[list[float]], n_clusters: int = 20) -> lis
     """
     model = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
     return model.fit_predict(embeddings)
-
 
 def generate_related_pages(data: list[dict], N: int = 5) -> None:
     """
@@ -408,14 +484,12 @@ def generate_related_pages(data: list[dict], N: int = 5) -> None:
             entry["related_pages"] = related
             progress.update(task, advance=1)
 
-
 def assign_clusters_to_sections(flat_sections: list[dict], cluster_ids: list[int]) -> None:
     """
     Attaches cluster IDs to the original section references in the data structure.
     """
     for section, cluster_id in zip(flat_sections, cluster_ids):
         section["ref"]["cluster"] = int(cluster_id)
-
 
 def generate_embedding(text: str, decimals=0) -> list:
     raw_vector = EMBED_MODEL.encode(text)
@@ -424,39 +498,38 @@ def generate_embedding(text: str, decimals=0) -> list:
     else:
         return [round(float(v), decimals) for v in raw_vector]
 
-
 def extract_keywords(text: str) -> list:
-    keywords = KEYBERT_MODEL.extract_keywords(text, keyphrase_ngram_range=(1, 3), stop_words="english", use_maxsum=True, top_n=10)
+    # Scale with length, but cap at 15
+    top_n = min(15, max(5, round(len(text) / 100)))
+
+    keywords = KEYBERT_MODEL.extract_keywords(
+        text,
+        keyphrase_ngram_range=(1, 3),
+        stop_words="english",
+        use_maxsum=True,
+        top_n=top_n
+    )
+
     return [kw for kw, _ in keywords]
 
-
-def enrich_page_verbose(page):
-    console.log(f"[green]Enriching:[/] {page['title']}")
-    return enrich_page(page)
-
-
 def enrich_page(page: dict) -> dict:
-    """
-    Enrich a wiki page by:
-    - Generating a semantic embedding for each section (including summary)
-    - Generating keywords from the full raw_text
-    - Removing raw_text to reduce storage
-    """
-    # Embed the summary as a semantic anchor
+    text_length = len(page.get("raw_text", ""))
+
+    # Always embed the summary
     page["semantic_embedding"] = generate_embedding(page["summary"])
 
-    # Enrich each section with its own embedding
+    # Generate keywords from the whole raw text
+    page["keywords"] = extract_keywords(page["raw_text"])
+
+    # Skip section-level embedding if short
+    if text_length < 3000:
+        return page
+
     for section in page.get("sections", []):
         combined_text = f"{section['heading']}\n\n{section['content']}".strip()
         section["semantic_embedding"] = generate_embedding(combined_text)
-        # For easier access in flattening
         section["full_text"] = combined_text
 
-    # Extract page-level keywords from the full raw text
-    page["keywords"] = extract_keywords(page["raw_text"])
-
-    # Clean up
-    del page["raw_text"]
     return page
 
 def generate_cluster_labels(flat_sections, cluster_ids, top_n=3):
@@ -474,7 +547,7 @@ def generate_cluster_labels(flat_sections, cluster_ids, top_n=3):
     cluster_labels = {}
 
     with Progress(console=console) as progress:
-        task = progress.add_task("[magenta]Generating cluster labels...", total=len(cluster_texts))
+        task = progress.add_task("[cyan]Generating cluster labels...", total=len(cluster_texts))
 
         for cluster_id, texts in cluster_texts.items():
             try:
@@ -488,14 +561,25 @@ def generate_cluster_labels(flat_sections, cluster_ids, top_n=3):
                 tfidf_scores = X.sum(axis=0).A1
                 sorted_terms = sorted(zip(terms, tfidf_scores), key=lambda x: x[1], reverse=True)
                 keywords = [term for term, _ in sorted_terms[:top_n]]
-                cluster_labels[cluster_id] = ", ".join(keywords)
+                cluster_labels[int(cluster_id)] = ", ".join(keywords)
             except Exception as e:
-                cluster_labels[cluster_id] = f"cluster_{cluster_id}"
-                console.log(f"[yellow]Warning: Failed to label cluster {cluster_id}: {e}")
+                cluster_labels[int(cluster_id)] = f"cluster_{int(cluster_id)}"
+                console.log(f"[yellow]Warning: Failed to label cluster {int(cluster_id)}: {e}")
 
             progress.update(task, advance=1)
 
     return cluster_labels
+
+def clean_data(pages: list[dict], sections: list[dict]):
+    for page in pages:
+        page.pop("semantic_embedding", None)
+        page.pop("raw_text", None)
+        for section in page.get("sections", []):
+            section.pop("semantic_embedding", None)
+            section.pop("full_text", None)
+
+    for section in sections:
+        section.pop("semantic_embedding", None)
 
 # --- Main ---
 
@@ -511,33 +595,41 @@ def main():
     raw_data = crawl_wiki(verbose=args.verbose)
 
     # Step 2: Enrich pages
-    console.log("[blue]Enriching pages with embeddings and keywords...")
-
     # Set SIGINT to default so parent can interrupt children cleanly
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    try:
-        with Pool(processes=args.workers or max_workers) as pool:
-            worker_fn = enrich_page_verbose if args.verbose else enrich_page
-            enriched_pages = list(track(
-                pool.imap(worker_fn, raw_data["pages"], chunksize=1),
+    enriched_pages = []
 
-                total=len(raw_data["pages"]),
-                description="[cyan]Enriching pages..."
-            ))
-    except KeyboardInterrupt:
-        console.log("[red]User interrupt detected. Terminating worker pool...")
-        pool.terminate()
-        pool.join()
-        exit(1)
+    with Progress(
+            TextColumn("[cyan]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            SmoothedTimeRemainingColumn(window=30),  # steadier ETA
+            console=console,
+            refresh_per_second=4,  # fewer redraws, less jitter
+    ) as progress:
+        task = progress.add_task("Enriching pages…", total=len(raw_data["pages"]))
+
+        try:
+            with Pool(processes=args.workers or max(1, max_workers)) as pool:
+                for result in pool.imap(enrich_page, raw_data["pages"], chunksize=4):
+                    if args.verbose:
+                        progress.log(f"[green]Enriched:[/] {result['title']}", highlight=False)
+
+                    enriched_pages.append(result)
+                    progress.update(task, advance=1)
+        except KeyboardInterrupt:
+            console.log("[red]Interrupted by user. Cleaning up pool...")
+            pool.terminate()
+            pool.join()
+            exit(1)
 
     # Step 3–7: Clustering, labeling, and similarity
     flat_sections, section_embeddings = extract_all_section_embeddings(enriched_pages)
-    console.log("[blue]Clustering sections...")
     section_cluster_ids = cluster_sections(section_embeddings, n_clusters=20)
     assign_clusters_to_sections(flat_sections, section_cluster_ids)
 
-    console.log("[blue]Generating human-readable cluster labels...")
     cluster_labels = generate_cluster_labels(flat_sections, section_cluster_ids)
     for section, cid in zip(flat_sections, section_cluster_ids):
         section["ref"]["cluster_label"] = cluster_labels[cid]
@@ -548,12 +640,7 @@ def main():
     generate_related_pages(flat_sections, N=5)
 
     # Step 8: Strip vectors for storage
-    for page in enriched_pages:
-        page.pop("semantic_embedding", None)
-        for section in page.get("sections", []):
-            section.pop("semantic_embedding", None)
-    for section in flat_sections:
-        section.pop("semantic_embedding", None)
+    clean_data(enriched_pages, flat_sections)
 
     # Step 9: Output
     wiki_name = args.wiki_name or raw_data["wiki_name"]
@@ -562,7 +649,7 @@ def main():
 
     final_data = {
         "wiki_name": wiki_name,
-        "content_format": "wikitext",
+        "content_format": "markdown",
         "embedding_model": f"sentence-transformers/{LLM_MODEL}",
         "pages": enriched_pages,
         "sections": flat_sections,
@@ -578,8 +665,25 @@ def main():
 
 
 if __name__ == "__main__":
+    start_time = time.time()
+
     try:
         main()
     except KeyboardInterrupt:
         console.log("[red]Process interrupted by user. Exiting.")
         exit(1)
+
+    # Compute duration
+    duration = int(time.time() - start_time)
+    days, rem = divmod(duration, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+
+    # Build output string conditionally (no seconds)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    if not parts: parts.append("0m")  # default if < 60 sec
+
+    console.log(f"[green]Done in: {' '.join(parts)}")
