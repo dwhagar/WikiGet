@@ -53,7 +53,7 @@ LLM_VECTOR_ROUND = 0 # 0 to disable rounding
 # Console and constants
 console = Console(log_time=True, log_path=False)
 os.environ["LOKY_MAX_CPU_COUNT"] = str(os.cpu_count())
-max_workers = round(os.cpu_count() * 0.6)
+max_workers = round(os.cpu_count() * 0.9)
 
 # Limit one thread-pool per process (we keep only one process now)
 torch.set_num_threads(max_workers)               # PyTorch kernels
