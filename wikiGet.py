@@ -7,6 +7,8 @@ import time
 from math import sqrt
 from datetime import datetime
 from typing import Optional
+import warnings
+import urllib.parse
 
 # ───────────────────────── Third-party packages ────────────────────────
 import numpy as np
@@ -25,11 +27,12 @@ from rich.progress import (
 )
 from rich.text import Text
 from sentence_transformers import SentenceTransformer
-from keybert import KeyBERT
-# noinspection PyUnresolvedReferences
-from keybert._maxsum import max_sum_distance
+from transformers import AutoTokenizer
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()        # suppress warnings, keep errors
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 # ──────────────────────── Rich < 10 fallback ───────────────────────────
 try:
@@ -73,7 +76,6 @@ PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
 LLM_MODEL = "all-mpnet-base-v2"
 LLM_VECTOR_ROUND = 0 # 0 to disable rounding
 EMBED_MODEL = SentenceTransformer(LLM_MODEL)
-KEYBERT_MODEL = KeyBERT(model=EMBED_MODEL)
 
 # Console and constants
 console = Console(log_time=True, log_path=False)
@@ -100,7 +102,6 @@ def sanitize_filename(title: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', ' ', title)[:255]
 
 def build_page_url(title: str) -> str:
-    import urllib.parse
     return f"{WIKI_URL.replace('/api.php', '')}/index.php?title=" + urllib.parse.quote(title.replace(" ", "_"))
 
 def clean_article_html(html: str) -> str:
@@ -166,7 +167,6 @@ def html_to_markdown(html: str) -> str:
     md_text = re.sub(r"\n{3,}", "\n\n", md_text).strip()
     return md_text
 
-
 def html_to_plaintext(html: str, sep: str = "\n") -> str:
     """
     Return readable plain text from cleaned HTML. Uses the same cleaner so
@@ -177,7 +177,6 @@ def html_to_plaintext(html: str, sep: str = "\n") -> str:
         tag.decompose()
     text = soup.get_text(separator=sep, strip=True)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
-
 
 def _get_item_title(obj: dict | str | None) -> str:
     """
@@ -198,6 +197,96 @@ def _get_item_title(obj: dict | str | None) -> str:
         title = str(obj)
 
     return title.replace("_", " ")
+
+def split_long_text(text: str, tokenizer, target_tokens: int) -> list[str]:
+    """
+    Break `text` into ≤ target_tokens segments, preferring blank-line splits.
+    Falls back to hard token slicing when paragraphs exceed the limit.
+    """
+    paragraphs = re.split(r"\n\s*\n", text)
+    chunks, current, cur_tok = [], [], 0
+
+    for para in paragraphs:
+        p_tok = len(tokenizer.encode(para, add_special_tokens=False))
+
+        if cur_tok + p_tok > target_tokens and current:
+            chunks.append("\n\n".join(current))
+            current, cur_tok = [], 0
+
+        if p_tok > target_tokens:                    # paragraph itself too big
+            ids = tokenizer.encode(para, add_special_tokens=False)
+            for i in range(0, len(ids), target_tokens):
+                chunk = tokenizer.decode(ids[i : i + target_tokens])
+                chunks.append(chunk)
+            continue
+
+        current.append(para)
+        cur_tok += p_tok
+
+    if current:
+        chunks.append("\n\n".join(current))
+
+    return chunks or [text[: target_tokens * 4]]  # crude fallback
+
+def suggest_batch_size(
+    pages: list[dict],
+    embed_model,
+    ram_gb: int = 16,
+    percentile: float = 0.95,
+    safety_factor: float = 0.75,   # keep 25 % RAM free
+    min_size: int = 4,
+    max_size: int = 64,
+) -> int:
+    """
+    • Adds `page["n_tokens"]` to every page (counted once, cached forever).
+    • Returns a batch size that fits comfortably in `ram_gb` of system RAM.
+
+    Heuristic: use the `percentile` token length as the typical sequence
+    length, assume activations ≈ 2 × (hidden_dim × tokens × 4 bytes),
+    and reserve (1 – safety_factor) of RAM for Python/OS overhead.
+    """
+    if not pages:
+        return min_size
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Token indices sequence length is longer than the specified maximum",
+        module=r"transformers.tokenization_utils_base",
+    )
+
+    # ── resolve tokenizer (reuse if already present) ─────────────────────
+    tok = getattr(embed_model, "tokenizer", None)
+    if tok is None:
+        model_name = (
+            getattr(embed_model, "model_name_or_path", None)
+            or getattr(embed_model, "model_name", None)
+            or "sentence-transformers/"+embed_model.__class__.__name__
+        )
+        tok = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=True,
+            local_files_only=True,      # stay offline
+        )
+
+    # ── count tokens once and cache in each page ─────────────────────────
+    lengths = []
+    for p in pages:
+        if "n_tokens" not in p:                     # skip if already set
+            p["n_tokens"] = len(tok.encode(
+                p["content"], add_special_tokens=False
+            ))
+        lengths.append(p["n_tokens"])
+
+    # ── pick representative sequence length (e.g., 95th percentile) ─────
+    seq_len = sorted(lengths)[int(len(lengths) * percentile)]
+    hidden_dim = embed_model.get_sentence_embedding_dimension()
+
+    # ── memory budget estimation ─────────────────────────────────────────
+    bytes_per_example = hidden_dim * seq_len * 4 * 2        # rough upper-bound
+    avail_bytes = int(ram_gb * safety_factor * (1024 ** 3))
+
+    size = max(min_size, avail_bytes // bytes_per_example)
+    return min(size, max_size)
 
 class EMATimeRemainingColumn(TimeRemainingColumn):
     """ETA column with exponential moving-average smoothing."""
@@ -505,40 +594,133 @@ def generate_embedding(text: str, decimals=0) -> list:
     else:
         return [round(float(v), decimals) for v in raw_vector]
 
-def extract_keywords(text: str) -> list:
-    # Scale with length, but cap at 15
+def extract_keywords(text: str) -> list[str]:
+    """
+    Fast statistical keyword extraction using TF-IDF:
+    • Considers 1–3-gram phrases,
+    • Drops English stop-words,
+    • Returns top-N scored terms (5–15, scaled by text length).
+    """
+    # 1. Determine how many keywords to return
     top_n = min(15, max(5, round(len(text) / 100)))
 
-    keywords = KEYBERT_MODEL.extract_keywords(
-        text,
-        keyphrase_ngram_range=(1, 3),
+    # 2. Fit TF-IDF on this single document
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 3),
         stop_words="english",
-        use_maxsum=True,
-        top_n=top_n
+        max_features=1000
     )
+    tfidf_matrix = vectorizer.fit_transform([text])
 
-    return [kw for kw, _ in keywords]
+    # 3. Extract feature names and their scores
+    features = vectorizer.get_feature_names_out()
+    scores = tfidf_matrix.toarray()[0]
 
-def enrich_page(page: dict) -> dict:
+    # 4. Pick top-N features by score
+    top_indices = sorted(
+        range(len(features)),
+        key=lambda i: scores[i],
+        reverse=True
+    )[:top_n]
+
+    return [features[i] for i in top_indices]
+
+def enrich_pages(
+    pages: list[dict],
+    batch_size: int = 32,
+    decimals: int = 0,
+    verbose: bool = False,
+) -> None:
     """
-    Attach a semantic embedding and keyword list to a page that now has only
-    one text field, `content`.
-
-    Adds:
-        page["semantic_embedding"] : list[float]
-        page["keywords"]           : list[str]
+    1.  Splits pages into *long* (need chunking) and *normal* (fit context).
+    2.  Processes LONG pages **first** so ETA starts high and only improves.
+    3.  Timing now covers BOTH embedding and keyword extraction.
+    4.  Adds per-page log lines when `verbose` is True.
     """
-    text = page.get("content", "")
-    if not text:
-        return page    # empty stub page; nothing to enrich
+    if not pages:
+        return
 
-    # Whole-page embedding
-    page["semantic_embedding"] = generate_embedding(text)
+    tok        = EMBED_MODEL.tokenizer
+    max_len    = getattr(EMBED_MODEL, "max_seq_length", 512)
+    target_len = max_len - 8                         # leave tiny buffer
 
-    # Keywords from the whole text (KeyBERT auto-scales top_n internally)
-    page["keywords"] = extract_keywords(text)
+    # ── classify pages up front ───────────────────────────────────────────
+    long_pages, normal_pages = [], []
+    for p in pages:
+        p["n_tokens"] = len(tok.encode(p["content"], add_special_tokens=False))
+        (long_pages if p["n_tokens"] > max_len else normal_pages).append(p)
 
-    return page
+    with Progress(
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        EMATimeRemainingColumn(alpha=0.2),
+        console=console,
+        refresh_per_second=3,
+    ) as progress:
+        task = progress.add_task("Enriching pages...", total=len(pages))
+
+        # ───────────── 1) LONG pages first (chunked) ─────────────
+        for page in long_pages:
+            start = time.perf_counter()
+
+            chunks = split_long_text(page["content"], tok, target_len)
+            vecs   = EMBED_MODEL.encode(
+                chunks,
+                batch_size=len(chunks),
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            merged = np.mean(vecs, axis=0)
+            page["semantic_embedding"] = (
+                merged.tolist()
+                if decimals < 1 else [round(float(x), decimals) for x in merged]
+            )
+
+            page["keywords"] = extract_keywords(page["content"])
+            elapsed = time.perf_counter() - start
+
+            if verbose:
+                progress.log(
+                    f"[green]Enriched:[/] {page['title']} "
+                    f"([cyan]{len(chunks)} chunks in {elapsed:.1f}s[/])",
+                    highlight=False,
+                )
+            progress.advance(task)
+
+        # ───────────── 2) NORMAL pages in batches ───────────────
+        for i in range(0, len(normal_pages), batch_size):
+            subset = normal_pages[i : i + batch_size]
+            texts  = [p["content"] for p in subset]
+
+            embed_start = time.perf_counter()
+            vecs = EMBED_MODEL.encode(
+                texts,
+                batch_size=len(texts),
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            embed_elapsed = time.perf_counter() - embed_start
+            per_embed = embed_elapsed / len(subset)
+
+            for p, v in zip(subset, vecs):
+                page_start = time.perf_counter()
+
+                p["semantic_embedding"] = (
+                    v.tolist()
+                    if decimals < 1 else [round(float(x), decimals) for x in v]
+                )
+                p["keywords"] = extract_keywords(p["content"])
+
+                total_elapsed = per_embed + (time.perf_counter() - page_start)
+                if verbose:
+                    progress.log(
+                        f"[green]Enriched:[/] {p['title']} "
+                        f"([cyan]{total_elapsed:.1f}s[/])",
+                        highlight=False,
+                    )
+                progress.advance(task)
 
 def clean_data(pages: list[dict]) -> None:
     """
@@ -548,6 +730,7 @@ def clean_data(pages: list[dict]) -> None:
     """
     for page in pages:
         page.pop("semantic_embedding", None)
+        page.pop("n_tokens", None)
 
 # --- Main ---
 
@@ -595,34 +778,24 @@ def main():
     console.log(f"[cyan]Pre-embedding snapshot saved to: {output_path}", highlight=False)
 
     # Step 2: Enrich pages
-    enriched_pages = []
 
-    with Progress(
-            TextColumn("[cyan]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            EMATimeRemainingColumn(alpha=0.2),  # steadier ETA
-            console=console,
-            refresh_per_second=2,  # redraw every 0.33 s
-    ) as progress:
-        task = progress.add_task("Enriching pages...", total=len(raw_data["pages"]))
+    # --- Decide batch size dynamically --------------------------------------
+    batch_size = suggest_batch_size(
+        raw_data["pages"],  # all page dicts
+        EMBED_MODEL,  # the already-loaded SentenceTransformer
+        ram_gb=16,  # adjust if you upgrade memory
+    )
+    if args.verbose:
+        console.log(f"[cyan]Using batch size:[/] {batch_size}", highlight=False)
 
-        for page in raw_data["pages"]:
-            enrich_start_time = time.perf_counter()
+    # --- Step 2: Enrich pages (batched) -------------------------------------
+    enrich_pages(
+        raw_data["pages"],
+        batch_size=batch_size,
+        verbose=args.verbose,
+    )
 
-            result = enrich_page(page)
-
-            elapsed = time.perf_counter() - enrich_start_time
-            if args.verbose:
-                progress.log(
-                    f"[green]Enriched:[/] {result['title']} "
-                    f"([cyan]{elapsed:.1f}s[/])",
-                    highlight=False,
-                )
-
-            enriched_pages.append(result)
-            progress.update(task, advance=1)
+    enriched_pages = raw_data["pages"]  # they’re now enriched in place
 
     # ── Step 3: Page-level related-pages and clustering ────────────────────
     console.log("[blue]Generating related pages...")
