@@ -4,11 +4,13 @@ import json
 import os
 import re
 import time
-from math import sqrt
 from datetime import datetime
 from typing import Optional
 import warnings
 import urllib.parse
+import concurrent.futures
+import hashlib
+import random
 
 # ───────────────────────── Third-party packages ────────────────────────
 import numpy as np
@@ -27,12 +29,12 @@ from rich.progress import (
 )
 from rich.text import Text
 from sentence_transformers import SentenceTransformer
+from keybert import KeyBERT
 from transformers import AutoTokenizer
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()        # suppress warnings, keep errors
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 # ──────────────────────── Rich < 10 fallback ───────────────────────────
 try:
@@ -55,25 +57,10 @@ CATEGORY_BLACKLIST = [
     "Abandoned", "OOC", "Sources of Inspiration", "Star Trek", "Star Wars",
     "Talk Pages", "Denied or Banned", "Unapproved"
 ]
-PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:"]
+PAGE_BLACKLIST = ["User:", "Talk:", "Template:", "Special:", "Main Page"]
 
-# The two models I recommend for this are these, you can use any model
-# you want, but these should be the best to use.
-
-# 1. "all-MiniLM-L6-v2" (recommended default)
-#    - ✅ Fast and lightweight (384 dimensions)
-#    - ⚠️ Slightly lower semantic accuracy than mpnet
-#    - Ideal for large-scale or CPU-bound tasks
-#
-# 2. "all-mpnet-base-v2"
-#    - ✅ Higher accuracy (768 dimensions)
-#    - ⚠️ Slower and uses more memory
-#    - Better for precision-critical applications
-
-# These control the LLM model used for both keywords and embedding
-# doing this can increase the JSON file size by 5 to 20 times, so
-# implemented a rounding to 3 places to help reduce file size.
 LLM_MODEL = "all-mpnet-base-v2"
+KEYBERT_MODEL = "all-minilm-l6-v2"
 LLM_VECTOR_ROUND = 0 # 0 to disable rounding
 EMBED_MODEL = SentenceTransformer(LLM_MODEL)
 
@@ -84,6 +71,7 @@ max_workers = os.cpu_count()
 
 # Limit one thread-pool per process (we keep only one process now)
 torch.set_num_threads(max_workers)               # PyTorch kernels
+torch.set_num_interop_threads(max_workers)
 os.environ["OMP_NUM_THREADS"]  = str(max_workers)  # OpenMP
 os.environ["MKL_NUM_THREADS"]  = str(max_workers)  # Intel MKL (fallback)
 
@@ -425,35 +413,24 @@ def cluster_pages(
     pages: list[dict],
     n_clusters: int | None = None,
     random_state: int = 42,
-) -> dict[int, list[int]]:
+) -> tuple[dict[int, list[int]], list[list[float]]]:
     """
     Group pages by similarity of their `semantic_embedding`.
 
-    Parameters
-    ----------
-    pages        : list of page dicts (each must have "semantic_embedding").
-    n_clusters   : optional; if None, picks ⌈√(N/2)⌉ – a common heuristic
-                   that gives coarse thematic buckets without over-splitting.
-    random_state : passed to KMeans for deterministic results.
-
-    Returns
-    -------
-    cluster_index : dict {cluster_id: [page_index, …]}  (order = input order)
-
-    Side effects
-    ------------
-    Adds an int field `page["cluster"]` to every page dict.
+    Returns:
+      - cluster_index: dict {cluster_id: [page_index, …]}
+      - centroids: list of centroid vectors (centroids[i] is for cluster i)
     """
-
     if not pages:
-        return {}
+        return {}, []
 
     # ── choose cluster count automatically if not supplied
+    N = len(pages)
     if n_clusters is None:
-        n_clusters = max(2, int(np.ceil(sqrt(len(pages) / 2))))
+        n_clusters = max(2, int(np.ceil(np.sqrt(N / 2))))
 
     # ── gather embeddings
-    embeddings = np.array([p["semantic_embedding"] for p in pages])
+    embedding_matrix = np.array([p["semantic_embedding"] for p in pages])
 
     # ── run K-Means
     km = KMeans(
@@ -461,71 +438,83 @@ def cluster_pages(
         n_init="auto",
         random_state=random_state,
     )
-    labels = km.fit_predict(embeddings)
+    labels = km.fit_predict(embedding_matrix)
 
-    # ── attach cluster IDs & build quick lookup dict
+    # ── capture centroids for O(1) lookup by cluster ID
+    centroids = km.cluster_centers_.tolist()
+
+    # ── attach labels & build index
     cluster_index: dict[int, list[int]] = {}
     for idx, (page, cid) in enumerate(zip(pages, labels)):
-        cid_int = int(cid)  # avoid NumPy int subclasses
+        cid_int = int(cid)
         page["cluster"] = cid_int
         cluster_index.setdefault(cid_int, []).append(idx)
 
-    return cluster_index
+    return cluster_index, centroids
 
 # --- Phase 1: Crawl ---
+
+def threaded_fetch_page_data(title, verbose, progress, task_id):
+    data = fetch_page_data(title)
+
+    if verbose:
+        if data.get("blacklisted"):
+            progress.log(f"[yellow]Blacklisted:[/] {title}", highlight=False)
+        elif data.get("fetch_error"):
+            progress.log(f"[red]Fetch error:[/] {title}", highlight=False)
+        else:
+            progress.log(f"[green]Fetched:[/] {title}", highlight=False)
+
+    progress.update(task_id, advance=1)
+    return title, data
 
 def crawl_wiki(pages: list = None, verbose: bool = False, test: bool = False) -> dict:
     if pages is None:
         pages = fetch_all_pages()
 
     if test:
-        pages = pages[:10]
+        pages = random.sample(pages, min(10, len(pages)))
 
     output_pages = []
     category_map = {}
+    visited.clear()
     wiki_name = fetch_wiki_name()
+    thread_count = max(1, max_workers // 4)
 
-    # --- Progress bar for page fetching -------------------------------------
     with Progress(
-            TextColumn("[cyan]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            EMATimeRemainingColumn(alpha=0.2),     # same steady ETA
-            console=console,
-            refresh_per_second=3,                 # same refresh rate
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        EMATimeRemainingColumn(alpha=0.2),
+        console=console,
+        refresh_per_second=3,
     ) as progress:
         task = progress.add_task("Processing pages...", total=len(pages))
 
-        for title in pages:
-            data = fetch_page_data(title)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+            futures = [
+                executor.submit(threaded_fetch_page_data, title, verbose, progress, task)
+                for title in pages
+            ]
 
-            if verbose:
-                if data.get("blacklisted"):
-                    progress.log(f"[yellow]Blacklisted:[/] {title}", highlight=False)
-                elif data.get("fetch_error"):
-                    progress.log(f"[red]Fetch error:[/] {title}", highlight=False)
-                else:
-                    progress.log(f"[green]Fetched:[/] {title}", highlight=False)
+            for future in concurrent.futures.as_completed(futures):
+                title, data = future.result()
 
-            if data.get("blacklisted") or data.get("fetch_error"):
+                if data.get("blacklisted") or data.get("fetch_error"):
+                    visited.add(title)
+                    continue
+
+                output_pages.append(data)
                 visited.add(title)
-                progress.update(task, advance=1)
-                continue
 
-            output_pages.append(data)
-            visited.add(title)
-
-            # update category map
-            for cat in data.get("categories", []):
-                category_map.setdefault(cat, []).append(title)
-
-            progress.update(task, advance=1)
+                for cat in data.get("categories", []):
+                    category_map.setdefault(cat, []).append(title)
 
     return {
         "pages": output_pages,
         "categories": category_map,
-        "wiki_name": wiki_name
+        "wiki_name": wiki_name,
     }
 
 # --- Phase 2: Enrich ---
@@ -587,6 +576,53 @@ def generate_related_pages(data: list[dict], N: int = 5) -> None:
             entry["related_pages"] = related
             progress.update(task, advance=1)
 
+def build_clusters_data(pages: list[dict], cluster_index: dict[int, list[int]], centroids) -> dict:
+    """
+    Construct reverse cluster index with centroid and list of pages (title and key).
+    """
+    clusters: dict[int, dict] = {}
+    for cid, indices in cluster_index.items():
+        # ensure centroid is a plain list
+        centroid_vec = centroids[cid]
+        centroid_list = centroid_vec.tolist() if hasattr(centroid_vec, "tolist") else list(centroid_vec)
+        clusters[cid] = {
+            "centroid": centroid_list,
+            "pages": [
+                {"title": pages[i]["title"], "key": pages[i]["key"]}
+                for i in indices
+            ],
+        }
+    return clusters
+
+def assign_clusters_and_related(pages: list[dict]) -> None:
+    """
+    Compute MD5 keys, cluster via cluster_pages, strip embeddings,
+    and add a related_pages list of {title, key} for each page.
+    """
+    # 1) Unique key per page
+    for p in pages:
+        p["key"] = hashlib.md5(p["content"].encode("utf-8")).hexdigest()
+
+    # 2) Cluster in-place (cluster_pages sets page["cluster"])
+    cluster_index, _ = cluster_pages(pages)
+
+    # 3) Promote label to cluster_id
+    for p in pages:
+        p["cluster_id"] = p.pop("cluster")
+
+    # 4) Remove embeddings now that clustering is done
+    for p in pages:
+        p.pop("semantic_embedding", None)
+
+    # 5) Build related_pages by looking up peers in the same cluster
+    for p in pages:
+        peers = cluster_index[p["cluster_id"]]
+        p["related_pages"] = [
+            {"title": pages[i]["title"], "key": pages[i]["key"]}
+            for i in peers
+            if pages[i]["key"] != p["key"]
+        ]
+
 def generate_embedding(text: str, decimals=0) -> list:
     raw_vector = EMBED_MODEL.encode(text)
     if decimals < 1:
@@ -594,61 +630,20 @@ def generate_embedding(text: str, decimals=0) -> list:
     else:
         return [round(float(v), decimals) for v in raw_vector]
 
-def extract_keywords(text: str) -> list[str]:
-    """
-    Fast statistical keyword extraction using TF-IDF:
-    • Considers 1–3-gram phrases,
-    • Drops English stop-words,
-    • Returns top-N scored terms (5–15, scaled by text length).
-    """
-    # 1. Determine how many keywords to return
-    top_n = min(15, max(5, round(len(text) / 100)))
-
-    # 2. Fit TF-IDF on this single document
-    vectorizer = TfidfVectorizer(
-        ngram_range=(1, 3),
-        stop_words="english",
-        max_features=1000
-    )
-    tfidf_matrix = vectorizer.fit_transform([text])
-
-    # 3. Extract feature names and their scores
-    features = vectorizer.get_feature_names_out()
-    scores = tfidf_matrix.toarray()[0]
-
-    # 4. Pick top-N features by score
-    top_indices = sorted(
-        range(len(features)),
-        key=lambda i: scores[i],
-        reverse=True
-    )[:top_n]
-
-    return [features[i] for i in top_indices]
-
-def enrich_pages(
+def extract_keywords_parallel(
     pages: list[dict],
-    batch_size: int = 32,
-    decimals: int = 0,
+    max_workers: int,
     verbose: bool = False,
 ) -> None:
     """
-    1.  Splits pages into *long* (need chunking) and *normal* (fit context).
-    2.  Processes LONG pages **first** so ETA starts high and only improves.
-    3.  Timing now covers BOTH embedding and keyword extraction.
-    4.  Adds per-page log lines when `verbose` is True.
+    Parallel KeyBERT extraction using one-quarter of CPU cores.
+    Mutates pages by adding 'keywords' as a list of strings; shows per-page timing logs.
     """
-    if not pages:
-        return
+    threads = max(1, max_workers // 4)
 
-    tok        = EMBED_MODEL.tokenizer
-    max_len    = getattr(EMBED_MODEL, "max_seq_length", 512)
-    target_len = max_len - 8                         # leave tiny buffer
-
-    # ── classify pages up front ───────────────────────────────────────────
-    long_pages, normal_pages = [], []
-    for p in pages:
-        p["n_tokens"] = len(tok.encode(p["content"], add_special_tokens=False))
-        (long_pages if p["n_tokens"] > max_len else normal_pages).append(p)
+    # load once on CPU
+    st_model = SentenceTransformer(KEYBERT_MODEL, device="cpu")
+    kw_model = KeyBERT(model=st_model)
 
     with Progress(
         TextColumn("[cyan]{task.description}"),
@@ -659,68 +654,127 @@ def enrich_pages(
         console=console,
         refresh_per_second=3,
     ) as progress:
-        task = progress.add_task("Enriching pages...", total=len(pages))
+        task = progress.add_task("Extracting keywords.", total=len(pages))
 
-        # ───────────── 1) LONG pages first (chunked) ─────────────
-        for page in long_pages:
-            start = time.perf_counter()
-
-            chunks = split_long_text(page["content"], tok, target_len)
-            vecs   = EMBED_MODEL.encode(
-                chunks,
-                batch_size=len(chunks),
-                convert_to_numpy=True,
-                show_progress_bar=False,
+        def process_page(p):
+            t0 = time.perf_counter()
+            # this returns List[Tuple[str, float]]
+            raw = kw_model.extract_keywords(
+                p["content"],
+                keyphrase_ngram_range=(1, 3),
+                stop_words="english",
+                top_n=10,
             )
-            merged = np.mean(vecs, axis=0)
-            page["semantic_embedding"] = (
-                merged.tolist()
-                if decimals < 1 else [round(float(x), decimals) for x in merged]
-            )
+            elapsed = time.perf_counter() - t0
+            # unpack only the keyword strings
+            kws = [kw for kw, _ in raw]
+            return p, kws, elapsed
 
-            page["keywords"] = extract_keywords(page["content"])
-            elapsed = time.perf_counter() - start
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = [executor.submit(process_page, p) for p in pages]
+            for future in concurrent.futures.as_completed(futures):
+                page, kws, elapsed = future.result()
+                page["keywords"] = kws
+                if verbose:
+                    progress.log(
+                        f"[green]Keywords extracted:[/] {page['title']} ([cyan]{elapsed:.2f}s[/])",
+                        highlight=False,
+                    )
+                progress.advance(task)
 
-            if verbose:
-                progress.log(
-                    f"[green]Enriched:[/] {page['title']} "
-                    f"([cyan]{len(chunks)} chunks in {elapsed:.1f}s[/])",
-                    highlight=False,
-                )
-            progress.advance(task)
+def enrich_pages(
+    pages: list[dict],
+    batch_size: int = 32,
+    decimals: int = 0,
+    verbose: bool = False,
+) -> None:
+    """
+    Phase 1: Embedding with progress bar and verbose timing.
+    Mutates pages by adding 'semantic_embedding'.
+    """
+    if not pages:
+        return
 
-        # ───────────── 2) NORMAL pages in batches ───────────────
-        for i in range(0, len(normal_pages), batch_size):
-            subset = normal_pages[i : i + batch_size]
-            texts  = [p["content"] for p in subset]
+    tok = EMBED_MODEL.tokenizer
+    max_len = getattr(EMBED_MODEL, "max_seq_length", 512)
+    target_len = max_len - 8
+    items: list[tuple[dict, list[str]]] = []
+    for p in pages:
+        tokens = tok.encode(p["content"], add_special_tokens=False)
+        chunks = (
+            split_long_text(p["content"], tok, target_len)
+            if len(tokens) > max_len
+            else [p["content"]]
+        )
+        items.append((p, chunks))
 
-            embed_start = time.perf_counter()
-            vecs = EMBED_MODEL.encode(
+    with Progress(
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        EMATimeRemainingColumn(alpha=0.2),
+        console=console,
+        refresh_per_second=3,
+    ) as progress:
+        task = progress.add_task("Enriching pages...", total=len(items))
+        for i in range(0, len(items), batch_size):
+            batch = items[i : i + batch_size]
+            texts: list[str] = []
+            parts: list[int] = []
+            for page, chunks in batch:
+                parts.append(len(chunks))
+                texts.extend(chunks)
+
+            t0 = time.perf_counter()
+            vectors = EMBED_MODEL.encode(
                 texts,
                 batch_size=len(texts),
                 convert_to_numpy=True,
                 show_progress_bar=False,
             )
-            embed_elapsed = time.perf_counter() - embed_start
-            per_embed = embed_elapsed / len(subset)
+            batch_elapsed = time.perf_counter() - t0
 
-            for p, v in zip(subset, vecs):
-                page_start = time.perf_counter()
+            total_chunks = sum(parts)
+            avg_chunk_time = batch_elapsed / total_chunks if total_chunks else 0.0
 
-                p["semantic_embedding"] = (
-                    v.tolist()
-                    if decimals < 1 else [round(float(x), decimals) for x in v]
-                )
-                p["keywords"] = extract_keywords(p["content"])
+            idx = 0
+            for (page, _), n_parts in zip(batch, parts):
+                vecs = vectors[idx : idx + n_parts]
+                idx += n_parts
+                emb = vecs[0] if n_parts == 1 else np.mean(vecs, axis=0)
+                if decimals < 1:
+                    page["semantic_embedding"] = emb.tolist()
+                else:
+                    page["semantic_embedding"] = [
+                        round(float(x), decimals) for x in emb
+                    ]
 
-                total_elapsed = per_embed + (time.perf_counter() - page_start)
+                elapsed = avg_chunk_time * n_parts
                 if verbose:
+                    info = (
+                        f"{n_parts} chunks in {elapsed:.2f}s"
+                        if n_parts > 1
+                        else f"{elapsed:.2f}s"
+                    )
                     progress.log(
-                        f"[green]Enriched:[/] {p['title']} "
-                        f"([cyan]{total_elapsed:.1f}s[/])",
+                        f"[green]Enriched:[/] {page['title']} ([cyan]{info}[/])",
                         highlight=False,
                     )
                 progress.advance(task)
+
+def build_keyword_index(pages: list[dict]) -> dict[str, list[str]]:
+    """
+    Build an inverted index mapping each keyword to the titles of pages containing it.
+    """
+    index: dict[str, set[str]] = {}
+    for page in pages:
+        title = page.get("title", "")
+        for kw in page.get("keywords", []):
+            index.setdefault(kw, set()).add(title)
+
+    # Convert sets to sorted lists for consistency
+    return {kw: sorted(titles) for kw, titles in index.items()}
 
 def clean_data(pages: list[dict]) -> None:
     """
@@ -736,7 +790,7 @@ def clean_data(pages: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Semantic Wiki Processor")
-    parser.add_argument("-o", "--output", help="Output .json path")
+    parser.add_argument("-o", "--output", help="Output JSON path")
     parser.add_argument("-w", "--wiki-name", help="Override wiki name")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--workers", type=int, help="CPU threads to use")
@@ -747,78 +801,70 @@ def main():
     )
     args = parser.parse_args()
 
-    # Step 1: Crawl wiki content
-    if args.test_run:
-        console.log("[yellow]Test-run mode: limiting to 10 pages.")
-
     raw_data = crawl_wiki(verbose=args.verbose, test=args.test_run)
+    pages = raw_data["pages"]
+    categories = raw_data["categories"]
 
-    # ── Decide output path *before* any enrichment ─────────────────────────
-    wiki_name  = args.wiki_name or raw_data["wiki_name"]
-    date_str   = datetime.now().strftime("%Y-%m-%d")
-    output_path = args.output or f"{wiki_name} Data {date_str} Clean.json"
+    if args.test_run and not args.wiki_name:
+        wiki_name = "TEST"
+    elif args.wiki_name:
+        wiki_name = args.wiki_name
+    else:
+        wiki_name = raw_data["wiki_name"]
 
-    # ── Write pre-embedding snapshot --------------------------------------
-    pre_snapshot = {
-        "wiki_name":       wiki_name,
-        "content_format":  "markdown",
-        "pages":           raw_data["pages"],     # cleaned content only
-        "categories":      raw_data["categories"],
-        "note":            "PRE-EMBEDDING SNAPSHOT — embeddings, keywords, "
-                           "clusters will be added in the final pass."
-    }
+    # Generate unique keys for each page
+    for p in pages:
+        p["key"] = hashlib.md5(p["content"].encode("utf-8")).hexdigest()
 
-    # make parent folder if supplied path includes a directory
+    # Save a clean snapshot before enrichment
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    clean_output = args.output or f"{wiki_name} Data {date_str} Clean.json"
+    if os.path.dirname(clean_output):
+        os.makedirs(os.path.dirname(clean_output), exist_ok=True)
+    with open(clean_output, "w", encoding="utf-8") as f:
+        json.dump({
+            "wiki_name": wiki_name,
+            "content_format": "markdown",
+            "pages": pages,
+            "categories": categories,
+        }, f, ensure_ascii=False, indent=2)
+    console.log(f"[cyan]Clean data saved to: {clean_output}", highlight=False)
+
+    # Phase 1: Embedding
+    batch_size = suggest_batch_size(pages, EMBED_MODEL)
+    if args.verbose:
+        console.log(f"[cyan]Using batch size:[/] {batch_size}", highlight=False)
+    enrich_pages(pages, batch_size=batch_size, verbose=args.verbose)
+
+    # Phase 2: Clustering and related pages
+    cluster_index, centroids = cluster_pages(pages)
+    for p in pages:
+        p["cluster_id"] = p.pop("cluster")
+    # Remove embeddings now that clustering is complete
+    for p in pages:
+        p.pop("semantic_embedding", None)
+    clusters = build_clusters_data(pages, cluster_index, centroids)
+
+    # Phase 3: Keyword extraction
+    worker_count = args.workers or max_workers
+    extract_keywords_parallel(pages, max_workers=worker_count, verbose=args.verbose)
+    keyword_index = build_keyword_index(pages)
+
+    # Final output
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    output_path = args.output or f"{wiki_name} Data {date_str}.json"
     if os.path.dirname(output_path):
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(pre_snapshot, f, ensure_ascii=False, indent=2)
-
-    console.log(f"[cyan]Pre-embedding snapshot saved to: {output_path}", highlight=False)
-
-    # Step 2: Enrich pages
-
-    # --- Decide batch size dynamically --------------------------------------
-    batch_size = suggest_batch_size(
-        raw_data["pages"],  # all page dicts
-        EMBED_MODEL,  # the already-loaded SentenceTransformer
-        ram_gb=16,  # adjust if you upgrade memory
-    )
-    if args.verbose:
-        console.log(f"[cyan]Using batch size:[/] {batch_size}", highlight=False)
-
-    # --- Step 2: Enrich pages (batched) -------------------------------------
-    enrich_pages(
-        raw_data["pages"],
-        batch_size=batch_size,
-        verbose=args.verbose,
-    )
-
-    enriched_pages = raw_data["pages"]  # they’re now enriched in place
-
-    # ── Step 3: Page-level related-pages and clustering ────────────────────
-    console.log("[blue]Generating related pages...")
-    generate_related_pages(enriched_pages, N=5)  # similarity on page embeddings
-
-    console.log("[blue]Clustering pages...")
-    cluster_index = cluster_pages(enriched_pages)  # adds page["cluster"]
-
-    # ── Step 4: Strip vectors before storage ───────────────────────────────
-    clean_data(enriched_pages)  # new, page-only version
-
-    # ── Step 5: Output ─────────────────────────────────────────────────────
     final_data = {
         "wiki_name": wiki_name,
         "content_format": "markdown",
-        "embedding_model": f"sentence-transformers/{LLM_MODEL}",
-        "pages": enriched_pages,
-        "categories": raw_data["categories"],
-        "clusters": cluster_index,  # {cluster_id: [page_indices]}
+        "pages": pages,
+        "categories": categories,
+        "clusters": clusters,
+        "keyword_index": keyword_index,
     }
 
-    output_path = args.output or f"{wiki_name} Data {date_str}.json"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True) if os.path.dirname(output_path) else None
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final_data, f, ensure_ascii=False, indent=2)
 
