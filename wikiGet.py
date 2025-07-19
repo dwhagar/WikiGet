@@ -11,6 +11,7 @@ import urllib.parse
 import concurrent.futures
 import hashlib
 import random
+from collections import Counter
 
 # ───────────────────────── Third-party packages ────────────────────────
 import numpy as np
@@ -341,7 +342,6 @@ def fetch_wiki_name() -> str:
 def fetch_page_data(title: str) -> dict:
     """
     Retrieve one wiki page, clean the HTML, convert to Markdown, and return:
-
         {
             "title":      <page title>,
             "url":        <full wiki URL>,
@@ -349,15 +349,13 @@ def fetch_page_data(title: str) -> dict:
             "categories": [category names without "Category:"],
             "links":      [page links without "Category:"],
         }
-
     Skips pages or categories that match the PAGE_BLACKLIST or CATEGORY_BLACKLIST.
     """
-
-    # ------------------------------------------------------------------ guard
+    # guard against unwanted namespaces
     if any(prefix.lower() in title.lower() for prefix in PAGE_BLACKLIST):
         return {"title": title, "blacklisted": True}
 
-    # ----------------------------------------------------------------- fetch
+    # fetch raw parse output
     params = {
         "action": "parse",
         "page": title,
@@ -379,28 +377,24 @@ def fetch_page_data(title: str) -> dict:
     parse = data["parse"]
     raw_html: str = parse.get("text", "")
 
-    # -------------------------------------------------- collect & cleanse
-    # Original names from the API
+    # strip out any CSS <style>…</style> blocks
+    raw_html = re.sub(r'(?is)<style[^>]*>.*?</style>', '', raw_html)
+
+    # collect & cleanse metadata
     raw_categories = [_get_item_title(c) for c in parse.get("categories", [])]
     raw_links      = [_get_item_title(l) for l in parse.get("links", [])]
 
-    # Remove "Category:" prefix where present
-    strip_cat = lambda t: t[len("Category:") :] if t.lower().startswith("category:") else t
+    strip_cat = lambda t: t[len("Category:"):] if t.lower().startswith("category:") else t
     categories = [strip_cat(c) for c in raw_categories]
     links      = [strip_cat(l) for l in raw_links]
-
-    # Category blacklist (check against original names)
     if any(bc.lower() in c.lower() for bc in CATEGORY_BLACKLIST for c in raw_categories):
         return {"title": title, "blacklisted": True}
-
-    # Filter out page-namespace prefixes in links
     links = [l for l in links if not any(p.lower() in l.lower() for p in PAGE_BLACKLIST)]
 
-    # -------------------------------------------------- HTML → Markdown
+    # HTML → Markdown
     clean_html = clean_article_html(raw_html)
     markdown   = html_to_markdown(clean_html)
 
-    # -------------------------------------------------- final payload
     return {
         "title":      title,
         "url":        build_page_url(title),
@@ -623,6 +617,36 @@ def assign_clusters_and_related(pages: list[dict]) -> None:
             if pages[i]["key"] != p["key"]
         ]
 
+def summarize_cluster_keywords(cluster_map, page_map, max_keywords=15):
+    """
+    Returns top keywords per cluster, excluding any that appear only once.
+
+    Args:
+        cluster_map (dict[str, list[str]]): cluster_id → list of page titles
+        page_map (dict[str, dict]): title → page data with "keywords" field
+        max_keywords (int): max number of keywords to return per cluster
+
+    Returns:
+        dict[str, list[tuple[str, int]]]: cluster_id → list of (keyword, count)
+    """
+    cluster_keywords = {}
+
+    for cluster_id, titles in cluster_map.items():
+        counter = Counter()
+
+        for title in titles:
+            keywords = page_map.get(title, {}).get("keywords", [])
+            counter.update(keywords)
+
+        # Filter out keywords with count < 2
+        filtered = [(kw, count) for kw, count in counter.items() if count >= 2]
+
+        # Sort and limit to max_keywords
+        filtered.sort(key=lambda x: (-x[1], x[0]))
+        cluster_keywords[cluster_id] = filtered[:max_keywords]
+
+    return cluster_keywords
+
 def generate_embedding(text: str, decimals=0) -> list:
     raw_vector = EMBED_MODEL.encode(text)
     if decimals < 1:
@@ -654,7 +678,7 @@ def extract_keywords_parallel(
         console=console,
         refresh_per_second=3,
     ) as progress:
-        task = progress.add_task("Extracting keywords.", total=len(pages))
+        task = progress.add_task("Extracting keywords...", total=len(pages))
 
         def process_page(p):
             t0 = time.perf_counter()
@@ -799,24 +823,31 @@ def main():
         action="store_true",
         help="Process only the first 10 pages for a quick end-to-end test",
     )
+    parser.add_argument(
+        "--no-embedding",
+        action="store_true",
+        help="Fetch pages only; skip embedding, clustering, and keyword extraction",
+    )
     args = parser.parse_args()
 
+    # Phase 0: Fetch pages
     raw_data = crawl_wiki(verbose=args.verbose, test=args.test_run)
     pages = raw_data["pages"]
     categories = raw_data["categories"]
 
+    # Wiki name override
     if args.test_run and not args.wiki_name:
-        wiki_name = "TEST"
+        wiki_name = f"TEST {raw_data["wiki_name"]}"
     elif args.wiki_name:
         wiki_name = args.wiki_name
     else:
         wiki_name = raw_data["wiki_name"]
 
-    # Generate unique keys for each page
+    # Generate unique keys
     for p in pages:
         p["key"] = hashlib.md5(p["content"].encode("utf-8")).hexdigest()
 
-    # Save a clean snapshot before enrichment
+    # Save clean snapshot
     date_str = datetime.now().strftime("%Y-%m-%d")
     clean_output = args.output or f"{wiki_name} Data {date_str} Clean.json"
     if os.path.dirname(clean_output):
@@ -830,17 +861,20 @@ def main():
         }, f, ensure_ascii=False, indent=2)
     console.log(f"[cyan]Clean data saved to: {clean_output}", highlight=False)
 
+    # If skipping embedding, emit and exit
+    if args.no_embedding:
+        return
+
     # Phase 1: Embedding
     batch_size = suggest_batch_size(pages, EMBED_MODEL)
     if args.verbose:
         console.log(f"[cyan]Using batch size:[/] {batch_size}", highlight=False)
     enrich_pages(pages, batch_size=batch_size, verbose=args.verbose)
 
-    # Phase 2: Clustering and related pages
+    # Phase 2: Clustering
     cluster_index, centroids = cluster_pages(pages)
     for p in pages:
         p["cluster_id"] = p.pop("cluster")
-    # Remove embeddings now that clustering is complete
     for p in pages:
         p.pop("semantic_embedding", None)
     clusters = build_clusters_data(pages, cluster_index, centroids)
@@ -849,6 +883,16 @@ def main():
     worker_count = args.workers or max_workers
     extract_keywords_parallel(pages, max_workers=worker_count, verbose=args.verbose)
     keyword_index = build_keyword_index(pages)
+
+    # Build cluster keywords list
+    page_map = {p["title"]: p for p in pages}
+    cluster_map = {
+        cid: [page["title"] for page in cluster["pages"]]
+        for cid, cluster in clusters.items()
+    }
+    cluster_keywords = summarize_cluster_keywords(cluster_map, page_map)
+    for cid, kws in cluster_keywords.items():
+        clusters[cid]["keywords"] = kws
 
     # Final output
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -864,10 +908,8 @@ def main():
         "clusters": clusters,
         "keyword_index": keyword_index,
     }
-
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final_data, f, ensure_ascii=False, indent=2)
-
     console.log(f"[green]Final data saved to: {output_path}", highlight=False)
 
 if __name__ == "__main__":
