@@ -1,64 +1,77 @@
 # WikiGet for NotebookLM
 
-This project contains `wikiGet.py`, a Python script designed to download all content from a MediaWiki site and consolidate it into a single Markdown file, optimized for analysis with Google's NotebookLM.
+This project contains `wikiGet.py`, a Python script designed to download all content from a MediaWiki site and save it as a structured, multi-file collection of Markdown documents, optimized for analysis with Google's NotebookLM.
 
 ## Features
 
--   **Consolidated Output**: Fetches all pages from a wiki and saves them in a single `NotebookLM_Export.md` file.
--   **NotebookLM Optimized**: Formats the output with clear headers, metadata (URL, categories), and Markdown separators, making it easy for language models to parse.
--   **Configuration Driven**: All settings are managed via a `config.json` file, making the script reusable and easy to customize without editing code.
--   **Performance & Reliability**: Uses concurrent downloads to speed up the process and includes automatic retries for network errors or server rate limiting.
--   **Content Cleaning**: Converts wiki HTML to clean Markdown, stripping unnecessary elements like navigation boxes, edit links, and other boilerplate.
+-   **Advanced NLP Keyword Extraction**: Uses `spaCy` and `NLTK` to perform high-quality linguistic analysis, including lemmatization, part-of-speech analysis, named entity recognition, and noun chunking.
+-   **Intelligent Indexing**: Automatically generates three powerful index files: `_Master_Index.md`, `_Category_Index.md`, and `_Keyword_Index.md`.
+-   **Smart File Bundling**: To stay within NotebookLM's file limits, the script intelligently bundles small pages into a single file (`_Small_Pages.md`).
+-   **Configuration Driven**: All settings are managed via a `config.json` file.
+
+## Installation and Setup
+
+This project features a fully automated setup process.
+
+Navigate to the project's root directory in your terminal and run:
+```bash
+pip install .
+```
+This single command will:
+1.  Install the `wikiget` script.
+2.  Install all required Python libraries (`spacy`, `nltk`, `requests`, etc.).
+3.  Automatically download the necessary `nltk` stopwords and `spaCy` language models.
+
+There are no further manual setup steps required.
+
+## Output Structure
+
+The script generates an output directory containing:
+
+1.  **`_Master_Index.md`**: A master list of all pages with links to their content and metadata.
+2.  **`_Category_Index.md`**: An index grouping pages by category.
+3.  **`_Keyword_Index.md`**: An index of all extracted keywords and phrases, linking back to the pages where they appear.
+4.  **Individual Page Files**: A separate `.md` file for each "large" page.
+5.  **`_Small_Pages.md`**: A single file containing all "small" pages, with each page marked by a clear header and anchor.
 
 ## Usage
 
-The script is run from the command line:
+Once installed, you can run the script from any directory using the `wikiget` command:
 
 ```bash
-python wikiGet.py [OPTIONS]
+wikiget [OPTIONS]
 ```
 
 ### Options
 
--   `-c, --config FILE`: Specifies the path to a JSON configuration file. Defaults to `config.json`.
--   `-o, --output DIRECTORY`: Sets the output directory for the `NotebookLM_Export.md` file. This overrides the setting in the config file.
--   `--workers N`: Defines the number of concurrent workers for fetching pages. This overrides the setting in the config file.
--   `--test-run`: Processes only the first 20 pages, which is useful for testing configuration and connectivity.
--   `-v, --verbose`: Enables detailed logging of the script's progress and any errors encountered.
+-   `-c, --config FILE`: Path to a JSON configuration file (default: `config.json`).
+-   `-o, --output DIRECTORY`: Output directory for the generated files (overrides config).
+-   `--workers N`: Number of concurrent workers (overrides config).
+-   `--test-run`: Process only the first 20 pages.
+-   `-v, --verbose`: Enable detailed logging.
 
 ## Configuration
 
-The script is controlled by a `config.json` file. A `config.json.example` is provided to show the structure.
+The script is controlled by a `config.json` file. It is recommended to copy `config.json.example` to `config.json` and modify it.
 
 ```json
 {
   "wikiGet": {
     "wiki_url": "https://your-wiki.com/w/api.php",
-    "api_key": "YOUR_API_KEY_IF_NEEDED",
-    "category_blacklist": [
-      "CategoryToSkip1",
-      "CategoryToSkip2"
-    ],
-    "page_blacklist": [
-      "User:",
-      "Talk:",
-      "Template:"
-    ],
+    "api_key": "",
+    "category_blacklist": [],
+    "page_blacklist": [],
     "output_directory": "output",
     "workers": 8,
     "test_run": false,
-    "verbose": false
+    "verbose": false,
+    "small_page_threshold": 20000,
+    "key_phrase_threshold": 20000
   }
 }
 ```
 
 ### Configuration Fields
 
--   `wiki_url`: **(Required)** The full URL to your MediaWiki `api.php` endpoint.
--   `api_key`: An API key for your wiki, if one is required for access.
--   `category_blacklist`: A list of categories to exclude from the export. Pages in these categories will be skipped.
--   `page_blacklist`: A list of page title prefixes to exclude (e.g., `User:` or `Talk:`).
--   `output_directory`: The directory where `NotebookLM_Export.md` will be saved.
--   `workers`: The number of parallel threads to use for downloading pages.
--   `test_run`: If `true`, the script will only fetch the first 20 pages.
--   `verbose`: If `true`, the script will print detailed progress to the console.
+-   `small_page_threshold`: The character count below which a page is considered "small" and will be bundled.
+-   `key_phrase_threshold`: The character count above which the script will extract multi-word key phrases in addition to single keywords.
