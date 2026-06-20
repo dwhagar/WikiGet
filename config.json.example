@@ -1,0 +1,37 @@
+{
+  "wikiGet": {
+    "wiki_url": "https://wiki.moltenaether.com/w/api.php",
+    "api_key": "",
+    "large_page_threshold": 2000,
+    "min_group_size": 5,
+    "category_blacklist": [
+      "Abandoned",
+      "OOC",
+      "Sources of Inspiration",
+      "Star Trek",
+      "Star Wars",
+      "Talk Pages",
+      "Denied or Banned",
+      "Unapproved"
+    ],
+    "page_blacklist": [
+      "User:",
+      "Talk:",
+      "Template:",
+      "Special:",
+      "Main Page",
+      "Category:",
+      "File:"
+    ],
+    "output_directory": "output",
+    "workers": 8,
+    "test_run": false,
+    "verbose": false
+  },
+  "wikiSearch": {
+    "llm_model": "all-mpnet-base-v2",
+    "input_file": "output/_Index.json",
+    "output_file": "search_results.json",
+    "semantic_threshold": 0.25
+  }
+}
